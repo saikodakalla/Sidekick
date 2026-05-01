@@ -12,7 +12,6 @@ import {
   Globe,
   Home,
   LayoutDashboard,
-  Lightbulb,
   Mail,
   Megaphone,
   Menu,
@@ -815,9 +814,21 @@ function SidekickPanel({ isOpen, onClose }) {
       sender: 'user',
       text: trimmed,
     }
-    setMessages((current) => [...current, userMessage])
+    const assistantId = `assistant-${Date.now()}`
+    const placeholder = {
+      id: assistantId,
+      sender: 'assistant',
+      pending: 'thinking',
+      text: '',
+    }
+    setMessages((current) => [...current, userMessage, placeholder])
     setPrompt('')
     setIsThinking(true)
+
+    const updateAssistant = (patch) =>
+      setMessages((current) =>
+        current.map((m) => (m.id === assistantId ? { ...m, ...patch } : m)),
+      )
 
     try {
       const response = await fetch('/api/chat', {
@@ -828,18 +839,34 @@ function SidekickPanel({ isOpen, onClose }) {
           history: messages.slice(-6),
         }),
       })
-      const data = await response.json()
-      const assistantMessage = {
-        id: `assistant-${Date.now()}`,
-        sender: 'assistant',
-        text: data.display?.answer || data.error || createAssistantMessage(trimmed).text,
-        files: data.display?.files || [],
-        visual: data.display?.visual || null,
-        raw: data.raw || null,
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let newlineIndex
+        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newlineIndex).trim()
+          buffer = buffer.slice(newlineIndex + 1)
+          if (!line) continue
+          const event = JSON.parse(line)
+          if (event.type === 'plan') {
+            updateAssistant({ pending: event.plan?.needsFiles ? 'drive' : 'thinking' })
+          } else if (event.type === 'final') {
+            updateAssistant({
+              pending: null,
+              text: event.display?.answer || '',
+              files: event.display?.files || [],
+              visual: event.display?.visual || null,
+              raw: event.raw || null,
+            })
+          }
+        }
       }
-      setMessages((current) => [...current, assistantMessage])
     } catch {
-      setMessages((current) => [...current, createAssistantMessage(trimmed)])
+      updateAssistant({ pending: null, text: createAssistantMessage(trimmed).text })
     } finally {
       setIsThinking(false)
     }
@@ -866,37 +893,28 @@ function SidekickPanel({ isOpen, onClose }) {
                 expertise. What would you like help with?
               </p>
             </AssistantBubble>
-            <div className="connection-row">
-              <a className={connections?.google ? 'connected' : ''} href="/api/oauth/google/start">
-                {connections?.google ? 'Google Drive connected' : 'Connect Google Drive'}
-              </a>
-              <a className={connections?.microsoft ? 'connected' : ''} href="/api/oauth/microsoft/start">
-                {connections?.microsoft ? 'OneDrive connected' : 'Connect OneDrive'}
-              </a>
-            </div>
-            <div className="prompt-chips">
-              <button type="button" onClick={() => sendPrompt('Create a discount')}>
-                Create a discount
-              </button>
-              <button type="button" onClick={() => sendPrompt('Analyze store sales')}>
-                Analyze store
-              </button>
-              <button type="button" onClick={() => sendPrompt('Edit theme')}>
-                Edit theme
-              </button>
-              <button className="chip-icon" type="button" aria-label="More suggestions">
-                <Lightbulb size={20} />
-              </button>
-            </div>
+            {!connections?.google ? (
+              <div className="connection-row">
+                <a href="/api/oauth/google/start">Connect Google Drive</a>
+              </div>
+            ) : null}
           </div>
         ) : (
           messages.map((message) =>
             message.sender === 'assistant' ? (
               <AssistantBubble key={message.id}>
-                <p>{message.text}</p>
-                {message.files?.length ? <SourceFiles files={message.files} /> : null}
-                {message.visual ? <VisualSummary visual={message.visual} /> : null}
-                {message.chart ? <SalesReportCard /> : null}
+                {message.pending === 'drive' ? (
+                  <DriveLoading />
+                ) : message.pending === 'thinking' ? (
+                  <ThinkingLoading />
+                ) : (
+                  <>
+                    <p>{message.text}</p>
+                    {message.files?.length ? <SourceFiles files={message.files} /> : null}
+                    {message.visual ? <VisualSummary visual={message.visual} /> : null}
+                    {message.chart ? <SalesReportCard /> : null}
+                  </>
+                )}
               </AssistantBubble>
             ) : (
               <div className="message-row user-row" key={message.id}>
@@ -906,11 +924,6 @@ function SidekickPanel({ isOpen, onClose }) {
             ),
           )
         )}
-        {isThinking ? (
-          <AssistantBubble>
-            <p>Searching connected files and checking the most relevant results...</p>
-          </AssistantBubble>
-        ) : null}
       </div>
 
       <form
@@ -945,6 +958,23 @@ function AssistantBubble({ children }) {
         <img src="/sidekick-icon.svg" alt="" />
       </span>
       <div className="message assistant">{children}</div>
+    </div>
+  )
+}
+
+function DriveLoading() {
+  return (
+    <div className="drive-loading" role="status" aria-live="polite">
+      <img src="/8630399.png" alt="" />
+      <span>Checking Google Drive…</span>
+    </div>
+  )
+}
+
+function ThinkingLoading() {
+  return (
+    <div className="thinking-loading" role="status" aria-live="polite">
+      <span>Thinking…</span>
     </div>
   )
 }
@@ -994,17 +1024,79 @@ function SourceFiles({ files }) {
 }
 
 function VisualSummary({ visual }) {
-  if (!visual || visual.type === 'null' || !Array.isArray(visual.points) || visual.points.length === 0) {
-    return null
+  if (!visual || visual.type === 'null' || visual.type === null) return null
+
+  if (visual.type === 'table' && Array.isArray(visual.headers) && Array.isArray(visual.rows)) {
+    return (
+      <div className="visual-summary">
+        {visual.title ? <strong>{visual.title}</strong> : null}
+        <table className="visual-table">
+          <thead>
+            <tr>
+              {visual.headers.map((header, index) => (
+                <th key={index}>{header}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {visual.rows.slice(0, 50).map((row, rowIndex) => (
+              <tr key={rowIndex}>
+                {(Array.isArray(row) ? row : []).map((cell, cellIndex) => (
+                  <td key={cellIndex}>{String(cell ?? '')}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
   }
 
-  const max = Math.max(...visual.points.map((point) => Number(point.value) || 0), 1)
+  if (!Array.isArray(visual.points) || visual.points.length === 0) return null
+
+  const points = visual.points.slice(0, 8)
+  const max = Math.max(...points.map((point) => Number(point.value) || 0), 1)
+
+  if (visual.type === 'line') {
+    const width = 100
+    const height = 40
+    const stepX = points.length > 1 ? width / (points.length - 1) : 0
+    const path = points
+      .map((point, index) => {
+        const x = index * stepX
+        const y = height - ((Number(point.value) || 0) / max) * height
+        return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`
+      })
+      .join(' ')
+
+    return (
+      <div className="visual-summary">
+        <strong>{visual.title || 'Visual summary'}</strong>
+        <svg
+          className="visual-line"
+          viewBox={`0 0 ${width} ${height}`}
+          preserveAspectRatio="none"
+          aria-hidden="true"
+        >
+          <path d={path} fill="none" stroke="currentColor" strokeWidth="1.2" />
+        </svg>
+        <div className="visual-line-labels">
+          {points.map((point) => (
+            <span key={point.label}>
+              <em>{point.label}</em>
+              <b>{point.value}</b>
+            </span>
+          ))}
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="visual-summary">
       <strong>{visual.title || 'Visual summary'}</strong>
       <div>
-        {visual.points.slice(0, 6).map((point) => (
+        {points.map((point) => (
           <span key={point.label}>
             <em>{point.label}</em>
             <i style={{ width: `${Math.max(8, ((Number(point.value) || 0) / max) * 100)}%` }} />

@@ -94,8 +94,16 @@ async function route(req, res) {
 
   if (req.method === 'POST' && url.pathname === '/api/chat') {
     const body = await readJson(req)
-    const result = await answerFromCloudFiles(body.message || '', body.history || [])
-    sendJson(res, 200, result)
+    setCors(res)
+    res.writeHead(200, { 'content-type': 'application/x-ndjson; charset=utf-8' })
+    const emit = (obj) => res.write(JSON.stringify(obj) + '\n')
+    try {
+      await answerFromCloudFiles(emit, body.message || '', body.history || [])
+    } catch (error) {
+      console.error(error)
+      emit({ type: 'final', display: { answer: error.message || 'Unexpected error', files: [] }, raw: {} })
+    }
+    res.end()
     return
   }
 
@@ -146,29 +154,43 @@ async function finishOAuth(res, provider, url) {
   redirect(res, `${APP_ORIGIN}?connected=${provider}`)
 }
 
-async function answerFromCloudFiles(message, history) {
+async function answerFromCloudFiles(emit, message, history) {
   if (!message.trim()) {
-    return { ok: false, error: 'Message is required' }
+    emit({ type: 'final', display: { answer: 'Message is required', files: [] }, raw: {} })
+    return
   }
 
   const status = await getStatus()
-  if (!status.google && !status.microsoft) {
-    return {
-      ok: true,
-      display: {
-        answer:
-          'Connect Google Drive or OneDrive first, then I can search approved files and answer from their contents.',
-        files: [],
-      },
-      raw: { status },
-    }
+  const plan = await createSearchPlan(message, history)
+  emit({ type: 'plan', plan })
+
+  if (!plan.needsFiles) {
+    const answer = await chatReply(message, history)
+    emit({
+      type: 'final',
+      display: { answer, files: [], data: [], visual: null },
+      raw: { plan },
+    })
+    return
   }
 
-  const plan = await createSearchPlan(message, history)
+  if (!status.google && !status.microsoft) {
+    emit({
+      type: 'final',
+      display: {
+        answer:
+          'Connect Google Drive first, then I can search your files and answer from their contents.',
+        files: [],
+      },
+      raw: { plan, status },
+    })
+    return
+  }
+
   const providerNames = plan.providers?.length
     ? plan.providers.filter((provider) => status[provider])
     : ['google', 'microsoft'].filter((provider) => status[provider])
-  const queries = plan.queries?.length ? plan.queries.slice(0, 3) : [message]
+  const queries = plan.queries?.length ? plan.queries.slice(0, 5) : [message]
 
   const results = []
   for (const provider of providerNames) {
@@ -180,37 +202,122 @@ async function answerFromCloudFiles(message, history) {
     }
   }
 
-  const uniqueResults = dedupeFiles(results).slice(0, 8)
-  const filesWithText = []
-  for (const file of uniqueResults.slice(0, 5)) {
-    filesWithText.push({
+  const uniqueResults = dedupeFiles(results).slice(0, 15)
+  const candidates = await Promise.all(
+    uniqueResults.slice(0, 12).map(async (file) => ({
       ...file,
       text: await readFileText(file),
-    })
-  }
+    })),
+  )
 
+  const ranked = await rerankCandidates(message, candidates)
+  emit({ type: 'rerank', candidates: candidates.length, kept: Math.min(ranked.length, 5) })
+
+  const filesWithText = ranked.slice(0, 5)
   const display = await synthesizeAnswer(message, filesWithText)
-  return {
-    ok: true,
+  emit({
+    type: 'final',
     display,
     raw: {
       plan,
+      candidatesConsidered: candidates.map(({ text, ...file }) => ({ ...file, textPreview: (text || '').slice(0, 200) })),
       files: filesWithText.map(({ text, ...file }) => ({
         ...file,
-        textPreview: text.slice(0, 800),
+        textPreview: (text || '').slice(0, 800),
       })),
     },
+  })
+}
+
+async function rerankCandidates(question, candidates) {
+  if (candidates.length <= 5 || !process.env.ANTHROPIC_API_KEY) return candidates
+
+  const summaries = candidates.map((file, index) => ({
+    index,
+    name: file.name,
+    mimeType: file.mimeType,
+    snippet: (file.text || '').slice(0, 400).replace(/\s+/g, ' ').trim(),
+  }))
+
+  const text = await callAnthropic({
+    system: [
+      'You are a relevance ranker for cloud-file search results.',
+      'Given a user question and candidate files (name, MIME type, content snippet),',
+      'rank ALL candidates from most to least likely to answer the question.',
+      '',
+      'Return ONLY JSON: {"order":[<index>,<index>,...]} where each index is an integer referring to a candidate.',
+      'Include EVERY candidate index exactly once. Most relevant first, irrelevant last.',
+      '',
+      'Heuristics:',
+      '- A small spreadsheet whose content matches the question topic is MORE relevant than a large unrelated PDF that happens to mention the same word.',
+      '- Filename signals matter: a file named "Sales Report" is more relevant to a sales question than a generic doc.',
+      '- For numerical/quantitative questions, prefer spreadsheets and structured data over prose.',
+      '- For prose questions, prefer documents and presentations over spreadsheets.',
+    ].join('\n'),
+    messages: [{ role: 'user', content: JSON.stringify({ question, candidates: summaries }) }],
+    maxTokens: 300,
+  })
+
+  const parsed = parseJson(text, null)
+  if (!parsed?.order || !Array.isArray(parsed.order)) return candidates
+
+  const seen = new Set()
+  const ordered = []
+  for (const i of parsed.order) {
+    if (Number.isInteger(i) && i >= 0 && i < candidates.length && !seen.has(i)) {
+      ordered.push(candidates[i])
+      seen.add(i)
+    }
   }
+  for (let i = 0; i < candidates.length; i++) {
+    if (!seen.has(i)) ordered.push(candidates[i])
+  }
+  return ordered
 }
 
 async function createSearchPlan(message, history) {
   if (!process.env.ANTHROPIC_API_KEY) {
-    return { providers: [], queries: [message], reason: 'Anthropic API key missing; using direct query.' }
+    return { needsFiles: false, providers: [], queries: [], reason: 'Anthropic API key missing.' }
   }
 
   const text = await callAnthropic({
-    system:
-      'You turn a user question into cloud file search queries. Return only compact JSON: {"providers":["google","microsoft"],"queries":["..."],"reason":"..."}. Use both providers unless the user names one. Keep queries short.',
+    system: [
+      'You are the routing layer for Sidekick, a Shopify assistant.',
+      'For every user message, decide whether it requires searching the user\'s Google Drive / OneDrive files,',
+      'and if so, produce search keywords.',
+      '',
+      'Return ONLY compact JSON: {"needsFiles":bool,"providers":["google","microsoft"],"queries":["kw1","kw2"],"reason":"..."}',
+      '',
+      'ROUTING — when needsFiles=true:',
+      '- The message asks about the user\'s own data, files, documents, spreadsheets, reports, or numbers.',
+      '- The message references things only findable in their personal storage ("my sales", "our roadmap", "the Q1 report", "the deck I made", named files).',
+      '- The message asks to summarize/analyze/look up something specific.',
+      '',
+      'ROUTING — when needsFiles=false:',
+      '- Greetings or chit-chat ("hi", "hello", "thanks", "how are you").',
+      '- Generic questions about Shopify or e-commerce concepts that don\'t need user data.',
+      '- Meta questions about the assistant ("what can you do?").',
+      '- Anything that can be answered without reading a file.',
+      'When needsFiles=false, return queries:[] and providers:[].',
+      '',
+      'QUERY RULES (only matter when needsFiles=true; the API does literal substring matching):',
+      '- Each query is passed verbatim to Drive\'s `name contains` and `fullText contains` operators.',
+      '- NO operators, NO quotes, NO field prefixes. Never emit `filename:`, `name:`, `:`, AND/OR, parentheses, or wildcards.',
+      '- Prefer single distinctive words. Multi-word phrases only match if a file name/content contains that exact substring.',
+      '- Output 3-5 candidate keywords covering different angles: the topic, distinctive nouns the user said, likely file-name fragments, related synonyms.',
+      '- The user may NOT name a file. Infer keywords from the topic. Example: "what was my Q1 revenue?" -> ["revenue","sales","Q1","quarterly","financial"].',
+      '- If the user does name a file, include that name AND 2-3 fallback keywords from the rest of the question.',
+      '',
+      'PROVIDER RULES:',
+      '- Default to both ["google","microsoft"] unless the user explicitly names one.',
+      '',
+      'Examples:',
+      'User: "hello" -> {"needsFiles":false,"providers":[],"queries":[],"reason":"greeting"}',
+      'User: "what can you do?" -> {"needsFiles":false,"providers":[],"queries":[],"reason":"meta question"}',
+      'User: "what is in my Sidekick Test Sale sheet?" -> {"needsFiles":true,"providers":["google","microsoft"],"queries":["Sidekick","Test Sale","Sidekick Test"],"reason":"named file plus fallbacks"}',
+      'User: "summarize my recent sales numbers" -> {"needsFiles":true,"providers":["google","microsoft"],"queries":["sales","revenue","quarterly","report"],"reason":"topic keywords for discovery"}',
+      'User: "what is a good discount strategy for new customers?" -> {"needsFiles":false,"providers":[],"queries":[],"reason":"general advice, no user data needed"}',
+    ].join('\n'),
     messages: [
       ...history.slice(-4).map((entry) => ({
         role: entry.sender === 'assistant' ? 'assistant' : 'user',
@@ -221,7 +328,30 @@ async function createSearchPlan(message, history) {
     maxTokens: 500,
   })
 
-  return parseJson(text, { providers: [], queries: [message], reason: 'Could not parse plan.' })
+  return parseJson(text, { needsFiles: true, providers: [], queries: [message], reason: 'Could not parse plan; defaulting to file search.' })
+}
+
+async function chatReply(message, history) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return 'I need an Anthropic API key to answer. Add ANTHROPIC_API_KEY to .env.local.'
+  }
+  return callAnthropic({
+    system: [
+      'You are Sidekick, a friendly Shopify assistant.',
+      'Reply conversationally and concisely in plain text. No JSON, no markdown headers.',
+      'You can answer general questions about Shopify, e-commerce, and have casual chat.',
+      'If the user asks about their specific data, files, or numbers, tell them to ask a question that names what they want (e.g. "summarize my Q1 sales") so you can search their connected Drive.',
+      'Keep replies under 4 sentences unless the user asks for detail.',
+    ].join('\n'),
+    messages: [
+      ...history.slice(-6).map((entry) => ({
+        role: entry.sender === 'assistant' ? 'assistant' : 'user',
+        content: entry.text || '',
+      })),
+      { role: 'user', content: message },
+    ],
+    maxTokens: 400,
+  })
 }
 
 async function synthesizeAnswer(question, files) {
@@ -245,9 +375,34 @@ async function synthesizeAnswer(question, files) {
     text: file.text.slice(0, 7000),
   }))
 
+  const today = new Date().toISOString().slice(0, 10)
   const text = await callAnthropic({
-    system:
-      'Answer from the provided cloud file excerpts. Return only JSON: {"answer":"plain English answer","files":[{"title":"file","provider":"google|microsoft","url":"https://...","reason":"why used"}],"data":[{"label":"...","value":"..."}],"visual":{"type":"bar|line|table|null","title":"...","points":[{"label":"...","value":123}]}}. If the files do not answer the question, say what is missing.',
+    system: [
+      `Today's date is ${today}. Use it when the user says "this year", "last year", "Q2 last year", "recent", etc.`,
+      'Answer the user question from the provided cloud file excerpts.',
+      'Return ONLY JSON in this shape:',
+      '{',
+      '  "answer": "plain English answer, 1-4 sentences",',
+      '  "files": [{"title":"file name","provider":"google|microsoft","url":"https://...","reason":"why used"}],',
+      '  "data": [{"label":"...","value":"..."}],',
+      '  "visual": null OR a chart OR a table',
+      '}',
+      '',
+      'Visual format options:',
+      '- Omit (null) when a chart/table adds no value over the prose answer.',
+      '- Bar/line chart: {"type":"bar"|"line","title":"...","points":[{"label":"Q1","value":150000}, ...]}',
+      '  Use bar for category comparisons. Use line for time series / trends.',
+      '- Table: {"type":"table","title":"...","headers":["Col 1","Col 2"],"rows":[["a","b"],["c","d"]]}',
+      '  Use a table when the answer is best expressed as multiple rows × multiple columns (>= 2 columns).',
+      '',
+      'Choose the visual format that best fits the data:',
+      '- Pure single-metric breakdowns (revenue by quarter) -> bar or line chart.',
+      '- Trends over time -> line chart.',
+      '- Multi-attribute comparisons (rows = items, columns = attributes) -> table.',
+      '- Plain prose answers (no quantities) -> visual: null.',
+      '',
+      'If the files do not answer the question, set visual to null and say what is missing in answer.',
+    ].join('\n'),
     messages: [
       {
         role: 'user',
