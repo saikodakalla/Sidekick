@@ -1,0 +1,44 @@
+[
+  {
+    "id": "mock-1777658177236",
+    "title": "Lightweight Waterproof Rain Jacket",
+    "status": "Draft",
+    "inventory": "8 variants",
+    "type": "Jackets",
+    "vendor": "",
+    "price": "89.00",
+    "tags": [
+      "rain jacket",
+      "waterproof",
+      "commuting",
+      "lightweight",
+      "packable",
+      "reflective",
+      "biking",
+      "students",
+      "urban"
+    ],
+    "createdAt": "2026-05-01T17:56:17.236Z"
+  },
+  {
+    "id": "mock-1777659378382",
+    "title": "Lightweight Waterproof Rain Jacket",
+    "status": "Draft",
+    "inventory": "8 variants",
+    "type": "Jacket",
+    "vendor": "Nike",
+    "price": "89.00",
+    "tags": [
+      "rain jacket",
+      "waterproof",
+      "commuter",
+      "student",
+      "lightweight",
+      "packable",
+      "reflective",
+      "biking",
+      "urban"
+    ],
+    "createdAt": "2026-05-01T18:16:18.382Z"
+  }
+]

@@ -90,20 +90,23 @@ const orders = [
   },
 ]
 
-const products = [
+const initialProducts = [
   {
+    id: 'seed-1',
     title: 'Voyager Canvas Tote',
     status: 'Active',
     inventory: '126 in stock',
     type: 'Bags',
   },
   {
+    id: 'seed-2',
     title: 'Trail Merino Hoodie',
     status: 'Active',
     inventory: '18 low stock',
     type: 'Apparel',
   },
   {
+    id: 'seed-3',
     title: 'Recharge Bottle',
     status: 'Draft',
     inventory: '88 in stock',
@@ -192,6 +195,7 @@ function App() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [theme, setTheme] = useState('light')
   const [searchQuery, setSearchQuery] = useState('')
+  const [products, setProducts] = useState(initialProducts)
   const isDark = theme === 'dark'
 
   const activeLabel = useMemo(
@@ -421,7 +425,7 @@ function App() {
 
           {active === 'home' ? <HomeDashboard /> : null}
           {active === 'orders' ? <OrdersSection /> : null}
-          {active === 'products' ? <ProductsSection /> : null}
+          {active === 'products' ? <ProductsSection products={products} /> : null}
           {active === 'customers' ? <CustomersSection /> : null}
           {sectionDetails[active] ? <DetailSection section={sectionDetails[active]} /> : null}
         </main>
@@ -436,7 +440,12 @@ function App() {
         />
       ) : null}
 
-      <SidekickPanel isOpen={sidekickOpen} onClose={() => setSidekickOpen(false)} />
+      <SidekickPanel
+        isOpen={sidekickOpen}
+        onClose={() => setSidekickOpen(false)}
+        setProducts={setProducts}
+        onNavigateProducts={() => { setActive('products'); setSidekickOpen(false) }}
+      />
     </div>
   )
 }
@@ -613,7 +622,7 @@ function OrdersSection() {
   )
 }
 
-function ProductsSection() {
+function ProductsSection({ products }) {
   return (
     <section className="table-panel">
       <SectionToolbar
@@ -760,7 +769,7 @@ function DataTable({ columns, rows }) {
   )
 }
 
-function SidekickPanel({ isOpen, onClose }) {
+function SidekickPanel({ isOpen, onClose, setProducts, onNavigateProducts }) {
   const [prompt, setPrompt] = useState('')
   const [messages, setMessages] = useState([])
   const [connections, setConnections] = useState(null)
@@ -853,13 +862,15 @@ function SidekickPanel({ isOpen, onClose }) {
           if (!line) continue
           const event = JSON.parse(line)
           if (event.type === 'plan') {
-            updateAssistant({ pending: event.plan?.needsFiles ? 'drive' : 'thinking' })
+            const needsDrive = event.plan?.needsFiles || event.plan?.intent === 'product_create'
+            updateAssistant({ pending: needsDrive ? 'drive' : 'thinking' })
           } else if (event.type === 'final') {
             updateAssistant({
               pending: null,
               text: event.display?.answer || '',
               files: event.display?.files || [],
               visual: event.display?.visual || null,
+              product: event.display?.product || null,
               raw: event.raw || null,
             })
           }
@@ -910,9 +921,21 @@ function SidekickPanel({ isOpen, onClose }) {
                 ) : (
                   <>
                     <p>{message.text}</p>
-                    {message.files?.length ? <SourceFiles files={message.files} /> : null}
-                    {message.visual ? <VisualSummary visual={message.visual} /> : null}
-                    {message.chart ? <SalesReportCard /> : null}
+                    {message.product ? (
+                      <ProductDraftCard
+                        draft={message.product}
+                        files={message.files}
+                        setProducts={setProducts}
+                        onNavigateProducts={onNavigateProducts}
+                        shopifyConfigured={Boolean(connections?.shopifyConfigured)}
+                      />
+                    ) : (
+                      <>
+                        {message.files?.length ? <SourceFiles files={message.files} /> : null}
+                        {message.visual ? <VisualSummary visual={message.visual} /> : null}
+                        {message.chart ? <SalesReportCard /> : null}
+                      </>
+                    )}
                   </>
                 )}
               </AssistantBubble>
@@ -1104,6 +1127,329 @@ function VisualSummary({ visual }) {
           </span>
         ))}
       </div>
+    </div>
+  )
+}
+
+function ProductDraftCard({ draft, files, setProducts, onNavigateProducts, shopifyConfigured }) {
+  const [title, setTitle] = useState(draft.title || '')
+  const [price, setPrice] = useState(draft.price || '')
+  const [vendor, setVendor] = useState(draft.vendor || '')
+  const [mediaItems, setMediaItems] = useState(draft.media || [])
+
+  // Mock store state
+  const [mockCreating, setMockCreating] = useState(false)
+  const [mockCreated, setMockCreated] = useState(false)
+  const [mockError, setMockError] = useState(null)
+
+  // Shopify dev store state
+  const [shopifyCreating, setShopifyCreating] = useState(false)
+  const [shopifyResult, setShopifyResult] = useState(null)
+  const [shopifyError, setShopifyError] = useState(null)
+  const [shopifyMediaErrors, setShopifyMediaErrors] = useState([])
+
+  const editedDraft = { ...draft, title, price: price || null, vendor, media: mediaItems }
+  const validation = validateDraftClient(editedDraft)
+  const sourceFile = files?.[0]
+
+  const handleMockCreate = async () => {
+    setMockCreating(true)
+    setMockError(null)
+    try {
+      const response = await fetch('/api/products/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ draft: editedDraft }),
+      })
+      const data = await response.json()
+      if (data.ok) {
+        setProducts((prev) => [...prev, data.product])
+        setMockCreated(true)
+      } else {
+        setMockError(data.error || 'Failed to create product.')
+      }
+    } catch {
+      setMockError('Network error — could not create product.')
+    } finally {
+      setMockCreating(false)
+    }
+  }
+
+  const handleShopifyCreate = async () => {
+    setShopifyCreating(true)
+    setShopifyError(null)
+    setShopifyMediaErrors([])
+    try {
+      const response = await fetch('/api/shopify/products/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ draft: editedDraft }),
+      })
+      const data = await response.json()
+      if (data.success) {
+        setShopifyResult(data.product)
+        if (data.mediaErrors?.length) {
+          setShopifyMediaErrors(data.mediaErrors)
+        }
+      } else {
+        const msg = data.errors?.map((e) => e.message).join('; ') || 'Failed to create product in Shopify.'
+        setShopifyError(msg)
+      }
+    } catch {
+      setShopifyError('Network error — could not reach Shopify.')
+    } finally {
+      setShopifyCreating(false)
+    }
+  }
+
+  const variantPreview = draft.variants?.slice(0, 4).map((v) => v.title).join(', ')
+  const hasMoreVariants = (draft.variants?.length || 0) > 4
+  const tagPreview = draft.tags?.slice(0, 5).join(', ')
+
+  return (
+    <div className="product-draft-card">
+      <div className="draft-card-badges">
+        <span className="draft-badge">DRAFT</span>
+        {sourceFile && (
+          <a className="gdrive-badge" href={sourceFile.url} target="_blank" rel="noreferrer">
+            {sourceFile.provider === 'google' ? 'Google Drive' : 'OneDrive'} · {sourceFile.title}
+          </a>
+        )}
+      </div>
+
+      <div className="draft-field-row">
+        <label className="draft-field-label">Title</label>
+        <input
+          className="draft-field-input"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="Product title"
+        />
+      </div>
+
+      <div className="draft-fields-inline">
+        <div className="draft-field-row">
+          <label className="draft-field-label">Price ($)</label>
+          <input
+            className="draft-field-input"
+            value={price}
+            onChange={(e) => setPrice(e.target.value)}
+            placeholder="0.00"
+          />
+        </div>
+        <div className="draft-field-row">
+          <label className="draft-field-label">Vendor</label>
+          <input
+            className="draft-field-input"
+            value={vendor}
+            onChange={(e) => setVendor(e.target.value)}
+            placeholder="Vendor name"
+          />
+        </div>
+        {draft.productType && (
+          <div className="draft-field-row">
+            <label className="draft-field-label">Type</label>
+            <span className="draft-field-value">{draft.productType}</span>
+          </div>
+        )}
+      </div>
+
+      {variantPreview && (
+        <div className="draft-meta-row">
+          <span className="draft-meta-label">Variants</span>
+          <span className="draft-meta-value">
+            {variantPreview}{hasMoreVariants ? ` + ${draft.variants.length - 4} more` : ''}
+          </span>
+        </div>
+      )}
+
+      {tagPreview && (
+        <div className="draft-meta-row">
+          <span className="draft-meta-label">Tags</span>
+          <span className="draft-meta-value">{tagPreview}</span>
+        </div>
+      )}
+
+      {draft.seo?.title && (
+        <div className="draft-meta-row">
+          <span className="draft-meta-label">SEO title</span>
+          <span className="draft-meta-value">{draft.seo.title}</span>
+        </div>
+      )}
+
+      {/* Media section */}
+      <div className="draft-media-section">
+        <span className="draft-field-label">
+          Images {mediaItems.length > 0 ? `(${mediaItems.length} from Drive)` : ''}
+        </span>
+
+        {mediaItems.length > 0 ? (
+          <>
+            {mediaItems.some((m) => m.isPrivateWarning) && (
+              <p className="draft-media-access-warning">
+                ⚠ Shopify fetches these images directly — make each Drive file public
+                (&ldquo;Anyone with the link&rdquo;) or the image upload may fail.
+              </p>
+            )}
+            <div className="draft-media-grid">
+              {mediaItems.map((item, index) => (
+                <div className="draft-media-item" key={item.driveFileId || index}>
+                  <div className="draft-media-thumb">
+                    {item.thumbnailLink ? (
+                      <img
+                        src={item.thumbnailLink}
+                        alt={item.alt || item.sourceFileName}
+                        onError={(e) => {
+                          e.target.style.display = 'none'
+                          e.target.nextSibling.style.display = 'flex'
+                        }}
+                      />
+                    ) : null}
+                    <div
+                      className="draft-media-placeholder"
+                      style={item.thumbnailLink ? { display: 'none' } : {}}
+                    >
+                      🖼
+                    </div>
+                  </div>
+                  <span className="draft-media-filename" title={item.sourceFileName}>
+                    {item.sourceFileName?.replace(/\.[^.]+$/, '')}
+                  </span>
+                  <button
+                    type="button"
+                    className="draft-media-remove"
+                    onClick={() => setMediaItems((prev) => prev.filter((_, i) => i !== index))}
+                    aria-label={`Remove ${item.sourceFileName}`}
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          </>
+        ) : (
+          <p className="draft-no-images-hint">
+            No product images found in Drive. Add images to your product folder to include them.
+          </p>
+        )}
+      </div>
+
+      <ValidationChecklist warnings={validation.warnings} missingRequired={validation.missingRequired} />
+
+      {/* Mock store row */}
+      {mockCreated ? (
+        <div className="draft-success-banner">
+          Added to mock store!{' '}
+          <button type="button" className="draft-success-link" onClick={onNavigateProducts}>
+            View in Products →
+          </button>
+        </div>
+      ) : (
+        <>
+          {mockError && <p className="draft-error">{mockError}</p>}
+        </>
+      )}
+
+      {/* Shopify dev store row */}
+      {shopifyResult ? (
+        <div className="shopify-success-card">
+          <div className="shopify-success-header">
+            <span className="shopify-success-badge">Shopify Dev Store</span>
+            <span className="shopify-status-pill">{shopifyResult.status}</span>
+          </div>
+          <strong className="shopify-product-title">{shopifyResult.title}</strong>
+          <div className="shopify-product-meta">
+            <span>ID: <code>{shopifyResult.id.replace('gid://shopify/Product/', '')}</code></span>
+            <span>Handle: <code>{shopifyResult.handle}</code></span>
+            {shopifyResult.media?.length > 0 && (
+              <span>Media: {shopifyResult.media.length} image{shopifyResult.media.length > 1 ? 's' : ''} attached</span>
+            )}
+          </div>
+          {shopifyResult.previewUrl && (
+            <a className="shopify-preview-link" href={shopifyResult.previewUrl} target="_blank" rel="noreferrer">
+              Preview in dev store →
+            </a>
+          )}
+          {shopifyMediaErrors.length > 0 && (
+            <p className="draft-media-upload-error">
+              Product created, but media could not be attached — Shopify could not fetch the image URL.
+              Try making the Drive images public or use staged upload.
+            </p>
+          )}
+          <p className="shopify-post-create-note">
+            Kept as DRAFT. Add price, variants, inventory, and SEO before publishing.
+          </p>
+        </div>
+      ) : (
+        <>
+          {shopifyError && <p className="draft-error">{shopifyError}</p>}
+        </>
+      )}
+
+      {/* Action buttons — hide each once its creation succeeded */}
+      <div className="draft-buttons-row">
+        {!mockCreated && (
+          <button
+            type="button"
+            className="draft-create-button"
+            onClick={handleMockCreate}
+            disabled={mockCreating || !title}
+          >
+            {mockCreating ? 'Creating…' : 'Create in Mock Store'}
+          </button>
+        )}
+
+        {!shopifyResult && (
+          shopifyConfigured ? (
+            <button
+              type="button"
+              className="shopify-create-button"
+              onClick={handleShopifyCreate}
+              disabled={shopifyCreating || !title}
+            >
+              {shopifyCreating ? 'Creating in Shopify…' : 'Create in Shopify Dev Store'}
+            </button>
+          ) : (
+            <div className="shopify-disabled-hint">
+              Add <code>SHOPIFY_*</code> env vars to enable real dev-store creation.
+            </div>
+          )
+        )}
+      </div>
+    </div>
+  )
+}
+
+function validateDraftClient(draft) {
+  const warnings = [...(draft.warnings || [])]
+  const missingRequired = []
+  if (!draft.title) missingRequired.push('title')
+  if (!draft.price) missingRequired.push('price')
+  if (!draft.options?.length && !warnings.some((w) => w.toLowerCase().includes('variant'))) {
+    warnings.push('No product variants defined')
+  }
+  return { warnings, missingRequired }
+}
+
+function ValidationChecklist({ warnings, missingRequired }) {
+  if (!warnings.length && !missingRequired.length) return null
+  return (
+    <div className="validation-checklist">
+      <span className="checklist-heading">Review before publishing</span>
+      {missingRequired.map((field) => (
+        <div className="checklist-item error" key={`req-${field}`}>
+          <span className="checklist-icon">✕</span>
+          <span>Required: {field} is missing</span>
+        </div>
+      ))}
+      {warnings
+        .filter((w) => !missingRequired.some((f) => w.toLowerCase().includes(f)))
+        .map((warning, index) => (
+          <div className="checklist-item warning" key={`warn-${index}`}>
+            <span className="checklist-icon">⚠</span>
+            <span>{warning}</span>
+          </div>
+        ))}
     </div>
   )
 }

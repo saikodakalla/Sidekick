@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const projectRoot = path.resolve(__dirname, '..')
 const tokenPath = path.join(__dirname, '.tokens.json')
+const productsPath = path.join(__dirname, '.products.json')
 
 loadEnv(path.join(projectRoot, '.env'))
 loadEnv(path.join(projectRoot, '.env.local'))
@@ -76,7 +77,23 @@ async function route(req, res) {
       microsoft: Boolean(tokens.microsoft?.refresh_token || tokens.microsoft?.access_token),
       googleConfigured: Boolean(providerConfig.google.clientId && providerConfig.google.clientSecret),
       microsoftConfigured: Boolean(providerConfig.microsoft.clientId && providerConfig.microsoft.clientSecret),
+      shopifyConfigured: isShopifyConfigured(),
     })
+    return
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/shopify/status') {
+    sendJson(res, 200, {
+      configured: isShopifyConfigured(),
+      storeDomain: isShopifyConfigured() ? process.env.SHOPIFY_STORE_DOMAIN : null,
+    })
+    return
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/shopify/products/create') {
+    const body = await readJson(req)
+    const result = await createShopifyDraftProduct(body.draft)
+    sendJson(res, result.success ? 200 : 400, result)
     return
   }
 
@@ -104,6 +121,13 @@ async function route(req, res) {
       emit({ type: 'final', display: { answer: error.message || 'Unexpected error', files: [] }, raw: {} })
     }
     res.end()
+    return
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/products/create') {
+    const body = await readJson(req)
+    const result = await createMockProduct(body.draft)
+    sendJson(res, result.ok ? 200 : 400, result)
     return
   }
 
@@ -163,6 +187,11 @@ async function answerFromCloudFiles(emit, message, history) {
   const status = await getStatus()
   const plan = await createSearchPlan(message, history)
   emit({ type: 'plan', plan })
+
+  if (plan.intent === 'product_create') {
+    await productAgentFlow(emit, message, plan, status)
+    return
+  }
 
   if (!plan.needsFiles) {
     const answer = await chatReply(message, history)
@@ -286,12 +315,18 @@ async function createSearchPlan(message, history) {
       'For every user message, decide whether it requires searching the user\'s Google Drive / OneDrive files,',
       'and if so, produce search keywords.',
       '',
-      'Return ONLY compact JSON: {"needsFiles":bool,"providers":["google","microsoft"],"queries":["kw1","kw2"],"reason":"..."}',
+      'Return ONLY compact JSON: {"intent":"chat|files|product_create","needsFiles":bool,"providers":["google","microsoft"],"queries":["kw1","kw2"],"reason":"..."}',
+      '',
+      'INTENT RULES:',
+      '- intent:"product_create" when the user asks to create, draft, build, add, or launch a product from a doc, brief, file, or launch document in Drive. Set needsFiles:true.',
+      '- intent:"files" when the user wants to search/read/analyze files but not create a product. Set needsFiles:true.',
+      '- intent:"chat" for everything else. Set needsFiles:false.',
       '',
       'ROUTING — when needsFiles=true:',
       '- The message asks about the user\'s own data, files, documents, spreadsheets, reports, or numbers.',
       '- The message references things only findable in their personal storage ("my sales", "our roadmap", "the Q1 report", "the deck I made", named files).',
       '- The message asks to summarize/analyze/look up something specific.',
+      '- The user wants to create a product from a Drive doc (intent:product_create).',
       '',
       'ROUTING — when needsFiles=false:',
       '- Greetings or chit-chat ("hi", "hello", "thanks", "how are you").',
@@ -312,11 +347,13 @@ async function createSearchPlan(message, history) {
       '- Default to both ["google","microsoft"] unless the user explicitly names one.',
       '',
       'Examples:',
-      'User: "hello" -> {"needsFiles":false,"providers":[],"queries":[],"reason":"greeting"}',
-      'User: "what can you do?" -> {"needsFiles":false,"providers":[],"queries":[],"reason":"meta question"}',
-      'User: "what is in my Sidekick Test Sale sheet?" -> {"needsFiles":true,"providers":["google","microsoft"],"queries":["Sidekick","Test Sale","Sidekick Test"],"reason":"named file plus fallbacks"}',
-      'User: "summarize my recent sales numbers" -> {"needsFiles":true,"providers":["google","microsoft"],"queries":["sales","revenue","quarterly","report"],"reason":"topic keywords for discovery"}',
-      'User: "what is a good discount strategy for new customers?" -> {"needsFiles":false,"providers":[],"queries":[],"reason":"general advice, no user data needed"}',
+      'User: "hello" -> {"intent":"chat","needsFiles":false,"providers":[],"queries":[],"reason":"greeting"}',
+      'User: "what can you do?" -> {"intent":"chat","needsFiles":false,"providers":[],"queries":[],"reason":"meta question"}',
+      'User: "what is in my Sidekick Test Sale sheet?" -> {"intent":"files","needsFiles":true,"providers":["google","microsoft"],"queries":["Sidekick","Test Sale","Sidekick Test"],"reason":"named file plus fallbacks"}',
+      'User: "summarize my recent sales numbers" -> {"intent":"files","needsFiles":true,"providers":["google","microsoft"],"queries":["sales","revenue","quarterly","report"],"reason":"topic keywords for discovery"}',
+      'User: "what is a good discount strategy for new customers?" -> {"intent":"chat","needsFiles":false,"providers":[],"queries":[],"reason":"general advice, no user data needed"}',
+      'User: "create a product from the StormLite launch doc" -> {"intent":"product_create","needsFiles":true,"providers":["google","microsoft"],"queries":["StormLite","launch","product brief","StormLite launch"],"reason":"product creation from Drive doc"}',
+      'User: "draft a product from my jacket brief in Drive" -> {"intent":"product_create","needsFiles":true,"providers":["google","microsoft"],"queries":["jacket","brief","launch","product"],"reason":"product creation from Drive doc"}',
     ].join('\n'),
     messages: [
       ...history.slice(-4).map((entry) => ({
@@ -437,7 +474,7 @@ async function searchGoogleDrive(query) {
   const params = new URLSearchParams({
     q: `trashed=false and (name contains '${escaped}' or fullText contains '${escaped}')`,
     pageSize: '8',
-    fields: 'files(id,name,mimeType,webViewLink,modifiedTime,size)',
+    fields: 'files(id,name,mimeType,webViewLink,modifiedTime,size,parents)',
     supportsAllDrives: 'true',
     includeItemsFromAllDrives: 'true',
   })
@@ -450,7 +487,117 @@ async function searchGoogleDrive(query) {
     webUrl: file.webViewLink,
     modifiedTime: file.modifiedTime,
     size: file.size,
+    parents: file.parents || [],
   }))
+}
+
+// ─── Drive Image Discovery ────────────────────────────────────────────────────
+
+const IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp']
+const IMAGE_MIME_QUERY = IMAGE_MIME_TYPES.map((m) => `mimeType = '${m}'`).join(' or ')
+const IMAGE_HERO_KEYWORDS = ['front', 'hero', 'product', 'lifestyle', 'main', 'cover', 'primary', 'feature']
+
+async function searchDriveImagesInFolder(folderId) {
+  const token = await getAccessToken('google')
+  if (!token) return []
+
+  const params = new URLSearchParams({
+    q: `trashed=false and '${folderId}' in parents and (${IMAGE_MIME_QUERY})`,
+    pageSize: '20',
+    fields: 'files(id,name,mimeType,webViewLink,thumbnailLink,modifiedTime)',
+    supportsAllDrives: 'true',
+    includeItemsFromAllDrives: 'true',
+  })
+
+  try {
+    const data = await fetchJson(`https://www.googleapis.com/drive/v3/files?${params}`, token)
+    return data.files || []
+  } catch {
+    return []
+  }
+}
+
+async function searchDriveImagesGlobal(productTitle, fallbackQueries) {
+  const token = await getAccessToken('google')
+  if (!token) return []
+
+  const terms = [productTitle, ...fallbackQueries].filter(Boolean)
+  const searchWord = terms[0]?.split(/\s+/).find((w) => w.length > 2) || terms[0] || 'product'
+  const escaped = searchWord.replaceAll("'", "\\'")
+
+  const params = new URLSearchParams({
+    q: `trashed=false and (${IMAGE_MIME_QUERY}) and name contains '${escaped}'`,
+    pageSize: '15',
+    fields: 'files(id,name,mimeType,webViewLink,thumbnailLink,modifiedTime)',
+    supportsAllDrives: 'true',
+    includeItemsFromAllDrives: 'true',
+  })
+
+  try {
+    const data = await fetchJson(`https://www.googleapis.com/drive/v3/files?${params}`, token)
+    return data.files || []
+  } catch {
+    return []
+  }
+}
+
+function rankAndSelectImages(images, productTitle) {
+  const titleWords = productTitle.toLowerCase().split(/\s+/).filter((w) => w.length > 2)
+
+  const scored = images.map((img) => {
+    const nameLower = img.name.toLowerCase()
+    let score = 0
+    for (const kw of IMAGE_HERO_KEYWORDS) {
+      if (nameLower.includes(kw)) score += 2
+    }
+    for (const w of titleWords) {
+      if (nameLower.includes(w)) score += 3
+    }
+    return { ...img, _score: score }
+  })
+
+  const seen = new Set()
+  return scored
+    .filter((img) => {
+      if (seen.has(img.id)) return false
+      seen.add(img.id)
+      return true
+    })
+    .sort((a, b) => b._score - a._score)
+    .slice(0, 3)
+}
+
+function driveImageToMediaDraft(image) {
+  return {
+    originalSource: `https://drive.google.com/uc?export=download&id=${image.id}`,
+    mediaContentType: 'IMAGE',
+    alt: image.name.replace(/\.[^.]+$/, ''),
+    sourceFileName: image.name,
+    driveFileId: image.id,
+    thumbnailLink: image.thumbnailLink || null,
+    isPrivateWarning: true,
+  }
+}
+
+async function findDriveImagesForProduct(sourceFile, productTitle, fallbackQueries) {
+  try {
+    let images = []
+
+    if (sourceFile.provider === 'google') {
+      const parentIds = sourceFile.parents?.length ? sourceFile.parents : []
+      if (parentIds.length) {
+        images = await searchDriveImagesInFolder(parentIds[0])
+      }
+    }
+
+    if (!images.length) {
+      images = await searchDriveImagesGlobal(productTitle, fallbackQueries)
+    }
+
+    return rankAndSelectImages(images, productTitle).map(driveImageToMediaDraft)
+  } catch {
+    return []
+  }
 }
 
 async function searchMicrosoftDrive(query) {
@@ -673,6 +820,379 @@ function setCors(res) {
   res.setHeader('access-control-allow-methods', 'GET,POST,OPTIONS')
   res.setHeader('access-control-allow-headers', 'content-type')
 }
+
+// ─── Product Launch Agent ────────────────────────────────────────────────────
+
+async function productAgentFlow(emit, message, plan, status) {
+  if (!status.google && !status.microsoft) {
+    emit({
+      type: 'final',
+      display: {
+        answer: 'Connect Google Drive first so I can find your product launch doc.',
+        files: [],
+      },
+      raw: { plan },
+    })
+    return
+  }
+
+  const providerNames = plan.providers?.length
+    ? plan.providers.filter((p) => status[p])
+    : ['google', 'microsoft'].filter((p) => status[p])
+  const queries = plan.queries?.length ? plan.queries.slice(0, 5) : [message]
+
+  const results = []
+  for (const provider of providerNames) {
+    for (const query of queries) {
+      const found = provider === 'google'
+        ? await searchGoogleDrive(query)
+        : await searchMicrosoftDrive(query)
+      results.push(...found)
+    }
+  }
+
+  const candidates = dedupeFiles(results)
+  if (candidates.length === 0) {
+    emit({
+      type: 'final',
+      display: {
+        answer: "I couldn't find a product launch doc matching your query in Google Drive. Try rephrasing or check that the doc exists.",
+        files: [],
+      },
+      raw: { plan },
+    })
+    return
+  }
+
+  const sourceFile = candidates[0]
+  const docText = await readFileText(sourceFile)
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    emit({
+      type: 'final',
+      display: {
+        answer: `I found "${sourceFile.name}" but need an Anthropic API key to extract product data from it.`,
+        files: [toDisplayFile(sourceFile)],
+      },
+      raw: { plan, sourceFile },
+    })
+    return
+  }
+
+  const draft = await extractAndGenerateDraft(docText)
+  if (!draft) {
+    emit({
+      type: 'final',
+      display: {
+        answer: `I found "${sourceFile.name}" but couldn't extract structured product data from it. The document may not contain enough product information.`,
+        files: [toDisplayFile(sourceFile)],
+      },
+      raw: { plan, sourceFile },
+    })
+    return
+  }
+
+  // Search for product images in the same Drive folder (or globally as fallback)
+  const imageMedia = await findDriveImagesForProduct(sourceFile, draft.title, plan.queries || [])
+  if (imageMedia.length) {
+    draft.media = imageMedia
+    // Remove any "Missing product images" warning since we found some
+    if (draft.warnings) {
+      draft.warnings = draft.warnings.filter((w) => !w.toLowerCase().includes('missing product image'))
+    }
+  } else {
+    if (!draft.warnings) draft.warnings = []
+    if (!draft.warnings.some((w) => w.toLowerCase().includes('image'))) {
+      draft.warnings.push('No product images found in Drive folder')
+    }
+  }
+
+  const validation = validateProductDraft(draft)
+  const noteMultiple = candidates.length > 1 ? ` (${candidates.length - 1} other doc${candidates.length > 2 ? 's' : ''} found — using the most relevant one)` : ''
+  const imageNote = imageMedia.length ? ` Found ${imageMedia.length} image${imageMedia.length > 1 ? 's' : ''} in Drive.` : ''
+  const answer = validation.valid
+    ? `I found "${sourceFile.name}" in your Google Drive${noteMultiple} and extracted a product draft for "${draft.title}".${imageNote} Review the details below and click Create Draft Product to add it to your store.`
+    : `I found "${sourceFile.name}"${noteMultiple} and extracted a draft for "${draft.title}", but ${validation.missingRequired.length} required field(s) are missing.${imageNote} Review the warnings before creating.`
+
+  emit({
+    type: 'final',
+    display: {
+      answer,
+      files: [toDisplayFile(sourceFile)],
+      product: draft,
+      visual: null,
+    },
+    raw: { plan, sourceFile, validation },
+  })
+}
+
+async function extractAndGenerateDraft(docText) {
+  const text = await callAnthropic({
+    system: [
+      'You extract product data from a launch brief and return a Shopify product draft as compact JSON only.',
+      'Return ONLY a valid JSON object — no markdown, no explanation.',
+      '',
+      'Required schema:',
+      '{',
+      '  "title": "string (required)",',
+      '  "descriptionHtml": "<p>...</p> (required)",',
+      '  "price": "89.00 as string, or null if not stated in the document",',
+      '  "vendor": "string or null",',
+      '  "productType": "string or null",',
+      '  "status": "DRAFT",',
+      '  "tags": ["string"],',
+      '  "options": [{"name": "Size", "values": ["S", "M", "L", "XL"]}],',
+      '  "variants": [{"title": "S / Black", "price": "89.00", "sku": "", "inventoryQuantity": 0}],',
+      '  "metafields": [{"namespace": "custom", "key": "use_case", "value": "commuting"}],',
+      '  "seo": {"title": "string", "description": "string"},',
+      '  "warnings": ["string"]',
+      '}',
+      '',
+      'Rules:',
+      '- NEVER invent a price. If no price appears in the document, set price to null and add "Missing price" to warnings.',
+      '- Generate all cartesian-product variant combinations from options (max 20 variants).',
+      '- Always set status to "DRAFT".',
+      '- Add a warning for every important missing field: "Missing product images", "Missing inventory quantity", "Missing vendor", etc.',
+      '- Keep descriptionHtml concise — 1-2 sentences as a <p> tag.',
+      '- Infer sensible tags from the product category, use case, and features.',
+      '- Return ONLY the JSON object, no markdown, no code fences.',
+    ].join('\n'),
+    messages: [{ role: 'user', content: docText.slice(0, 10000) }],
+    maxTokens: 1800,
+  })
+
+  return parseJson(text, null)
+}
+
+/**
+ * @param {object} draft
+ * @returns {{ valid: boolean, warnings: string[], missingRequired: string[] }}
+ */
+function validateProductDraft(draft) {
+  const warnings = [...(draft.warnings || [])]
+  const missingRequired = []
+
+  if (!draft.title) missingRequired.push('title')
+  if (!draft.price) {
+    missingRequired.push('price')
+    if (!warnings.some((w) => w.toLowerCase().includes('price'))) {
+      warnings.push('Missing price')
+    }
+  }
+  if (!draft.options?.length) {
+    if (!warnings.some((w) => w.toLowerCase().includes('variant'))) {
+      warnings.push('No product variants defined')
+    }
+  }
+
+  return { valid: missingRequired.length === 0, warnings, missingRequired }
+}
+
+async function readMockProducts() {
+  if (!existsSync(productsPath)) return []
+  try {
+    return JSON.parse(await readFile(productsPath, 'utf8'))
+  } catch {
+    return []
+  }
+}
+
+async function saveMockProduct(product) {
+  await mkdir(__dirname, { recursive: true })
+  const products = await readMockProducts()
+  products.push(product)
+  await writeFile(productsPath, JSON.stringify(products, null, 2))
+}
+
+async function createMockProduct(draft) {
+  if (!draft?.title) return { ok: false, error: 'title is required' }
+  if (!draft?.price) return { ok: false, error: 'price is required — fill in the price field before creating' }
+
+  const inventoryLabel = draft.variants?.length
+    ? `${draft.variants.length} variant${draft.variants.length > 1 ? 's' : ''}`
+    : '0 in stock'
+
+  const product = {
+    id: `mock-${Date.now()}`,
+    title: draft.title,
+    status: 'Draft',
+    inventory: inventoryLabel,
+    type: draft.productType || 'Uncategorized',
+    vendor: draft.vendor || '',
+    price: draft.price,
+    tags: draft.tags || [],
+    createdAt: new Date().toISOString(),
+  }
+
+  await saveMockProduct(product)
+  return { ok: true, product }
+}
+
+// ─── Shopify Admin GraphQL ───────────────────────────────────────────────────
+
+function isShopifyConfigured() {
+  return Boolean(
+    process.env.SHOPIFY_STORE_DOMAIN &&
+    process.env.SHOPIFY_ADMIN_ACCESS_TOKEN &&
+    process.env.SHOPIFY_API_VERSION,
+  )
+}
+
+async function shopifyAdminGraphQL(query, variables = {}) {
+  if (!isShopifyConfigured()) {
+    throw new Error('Shopify Admin API is not configured. Add SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_ACCESS_TOKEN, and SHOPIFY_API_VERSION to .env.')
+  }
+
+  const { SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_ACCESS_TOKEN, SHOPIFY_API_VERSION } = process.env
+  const endpoint = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-shopify-access-token': SHOPIFY_ADMIN_ACCESS_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+  })
+
+  if (!response.ok) {
+    const body = await response.text()
+    throw new Error(`Shopify API HTTP ${response.status}: ${body.slice(0, 300)}`)
+  }
+
+  const json = await response.json()
+
+  if (json.errors?.length) {
+    const msg = json.errors.map((e) => e.message).join('; ')
+    throw new Error(`Shopify GraphQL errors: ${msg}`)
+  }
+
+  return json.data
+}
+
+const PRODUCT_CREATE_MUTATION = `
+  mutation productCreate($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
+    productCreate(product: $product, media: $media) {
+      product {
+        id
+        title
+        status
+        handle
+        onlineStorePreviewUrl
+        media(first: 5) {
+          nodes {
+            id
+            alt
+            mediaContentType
+            status
+          }
+        }
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`
+
+async function createShopifyDraftProduct(draft) {
+  if (!draft?.title) {
+    return { success: false, errors: [{ field: 'title', message: 'title is required' }] }
+  }
+
+  if (!isShopifyConfigured()) {
+    return { success: false, errors: [{ field: null, message: 'Shopify Admin API is not configured on this server.' }] }
+  }
+
+  const input = { status: 'DRAFT' }
+  if (draft.title) input.title = String(draft.title).trim()
+  if (draft.descriptionHtml) input.descriptionHtml = String(draft.descriptionHtml)
+  if (draft.vendor) input.vendor = String(draft.vendor)
+  if (draft.productType) input.productType = String(draft.productType)
+  if (Array.isArray(draft.tags) && draft.tags.length) input.tags = draft.tags
+
+  // Map draft.media -> Shopify CreateMediaInput[]
+  const mediaInput = (draft.media || [])
+    .filter((m) => m.originalSource && m.mediaContentType)
+    .map((m) => ({
+      originalSource: m.originalSource,
+      mediaContentType: m.mediaContentType,
+      alt: m.alt || null,
+    }))
+
+  try {
+    const variables = { product: input }
+    if (mediaInput.length) variables.media = mediaInput
+
+    const data = await shopifyAdminGraphQL(PRODUCT_CREATE_MUTATION, variables)
+    const result = data?.productCreate
+
+    if (!result) {
+      return { success: false, errors: [{ field: null, message: 'Unexpected empty response from Shopify.' }] }
+    }
+
+    if (result.userErrors?.length) {
+      // Surface media-specific errors clearly
+      const mediaErrors = result.userErrors.filter((e) =>
+        e.field?.includes('media') || e.message?.toLowerCase().includes('media') || e.message?.toLowerCase().includes('image'),
+      )
+      const otherErrors = result.userErrors.filter((e) => !mediaErrors.includes(e))
+
+      if (otherErrors.length) {
+        return { success: false, errors: result.userErrors }
+      }
+
+      // Product was created but media failed — return success with mediaErrors
+      return {
+        success: true,
+        mediaErrors,
+        product: {
+          id: result.product.id,
+          title: result.product.title,
+          status: result.product.status,
+          handle: result.product.handle,
+          previewUrl: result.product.onlineStorePreviewUrl || null,
+          media: result.product.media?.nodes || [],
+        },
+      }
+    }
+
+    return {
+      success: true,
+      mediaErrors: [],
+      product: {
+        id: result.product.id,
+        title: result.product.title,
+        status: result.product.status,
+        handle: result.product.handle,
+        previewUrl: result.product.onlineStorePreviewUrl || null,
+        media: result.product.media?.nodes || [],
+      },
+    }
+  } catch (error) {
+    return { success: false, errors: [{ field: null, message: error.message }] }
+  }
+}
+
+// ─── Legacy GraphQL input mapper (reference/P2) ──────────────────────────────
+// Used when variants + options + metafields are added later.
+// Required scope: write_products
+function mapProductDraftToShopifyGraphQLInput(draft) {
+  return {
+    title: draft.title,
+    descriptionHtml: draft.descriptionHtml,
+    vendor: draft.vendor,
+    productType: draft.productType,
+    status: 'DRAFT',
+    tags: draft.tags,
+    // TODO: productOptions + productVariantsBulkCreate for price/inventory per variant
+    // TODO: metafields
+    // TODO: media
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function loadEnv(filePath) {
   if (!existsSync(filePath)) return
