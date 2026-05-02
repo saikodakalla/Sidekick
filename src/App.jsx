@@ -1225,6 +1225,33 @@ const TOOL_LABELS = {
   delete_collection: "Deleting collection",
   add_product_to_collection: "Adding to collection",
   get_menus: "Reading menus",
+  run_ux_audit: "Running UX Auditor Agent",
+  run_product_clarity_audit: "Running Product Clarity Agent",
+  run_discoverability_audit: "Running Discoverability Scout",
+};
+
+const AUDIT_AGENT_CONFIGS = {
+  run_ux_audit: {
+    name: "UX Auditor Agent",
+    tag: "UX",
+    icon: "🎨",
+    description: "Analyzing storefront design, navigation architecture, trust signals, and user experience across 5 dimensions",
+    accentClass: "agent-spawn--purple",
+  },
+  run_product_clarity_audit: {
+    name: "Product Clarity Agent",
+    tag: "CLARITY",
+    icon: "📋",
+    description: "Analyzing product descriptions, image completeness, pricing clarity, and audience targeting — inferring target audience and business context from listing data",
+    accentClass: "agent-spawn--blue",
+  },
+  run_discoverability_audit: {
+    name: "Discoverability Scout",
+    tag: "DISCOVERY",
+    icon: "🔍",
+    description: "Simulating how AI shopping assistants discover and recommend products across 6 realistic shopper queries",
+    accentClass: "agent-spawn--amber",
+  },
 };
 
 function StorefrontLoading({ actions }) {
@@ -1501,7 +1528,7 @@ function ProductDraftCard({
   return (
     <div className="product-draft-card">
       <div className="draft-card-badges">
-        <span className="draft-badge">DRAFT</span>
+        <span className="draft-badge active-badge">ACTIVE</span>
         {sourceFile && (
           <a
             className="gdrive-badge"
@@ -1696,7 +1723,7 @@ function ProductDraftCard({
             </p>
           )}
           <p className="shopify-post-create-note">
-            Created as DRAFT in your Shopify Admin.
+            Product is now active and visible in your Online Store.
           </p>
         </div>
       ) : (
@@ -1837,10 +1864,34 @@ function StorefrontSection() {
             </div>
           )}
           {events.map((ev, i) => {
+            // Audit tool calls render as a special "agent spawn" card
+            if (ev.type === "tool_call" && AUDIT_AGENT_CONFIGS[ev.name]) {
+              const agent = AUDIT_AGENT_CONFIGS[ev.name];
+              return (
+                <div key={i} className={`agent-spawn-card ${agent.accentClass}`}>
+                  <div className="agent-spawn-header">
+                    <span className="agent-spawn-icon">{agent.icon}</span>
+                    <div className="agent-spawn-info">
+                      <div className="agent-spawn-title-row">
+                        <strong className="agent-spawn-name">{agent.name}</strong>
+                        <span className="agent-spawn-badge">{agent.tag}</span>
+                      </div>
+                      <span className="agent-spawn-status">
+                        <span className="agent-spawn-pulse" />
+                        Spawning agent…
+                      </span>
+                    </div>
+                  </div>
+                  <p className="agent-spawn-desc">{agent.description}</p>
+                </div>
+              );
+            }
+
+            // Generic tool calls
             if (ev.type === "tool_call") {
               return (
                 <div key={i} className="storefront-event tool-call">
-                  <strong>calling {ev.name}</strong>
+                  <strong>→ {TOOL_LABELS[ev.name] ?? ev.name}</strong>
                   {ev.input && Object.keys(ev.input).length > 0 && (
                     <span className="storefront-event-meta">
                       {JSON.stringify(ev.input).slice(0, 120)}
@@ -1849,6 +1900,21 @@ function StorefrontSection() {
                 </div>
               );
             }
+
+            // Audit tool results: suppress raw JSON — audit_report renders the card
+            if (ev.type === "tool_result" && AUDIT_AGENT_CONFIGS[ev.name]) {
+              if (ev.error) {
+                return (
+                  <div key={i} className="audit-step-line audit-step-line--error">
+                    <span className="audit-step-arrow">✕</span>
+                    <span>{AUDIT_AGENT_CONFIGS[ev.name].name} — {ev.result?.error || "failed"}</span>
+                  </div>
+                );
+              }
+              return null;
+            }
+
+            // Generic tool results
             if (ev.type === "tool_result") {
               const summary = ev.error
                 ? "Error: " + (ev.result?.error || "failed")
@@ -1857,11 +1923,12 @@ function StorefrontSection() {
                 : String(ev.result).slice(0, 160);
               return (
                 <div key={i} className="storefront-event tool-result">
-                  <strong>{ev.name}</strong>
+                  <strong>{TOOL_LABELS[ev.name] ?? ev.name}</strong>
                   <span className="storefront-event-meta">{summary}</span>
                 </div>
               );
             }
+
             if (ev.type === "agent_text") {
               return (
                 <div key={i} className="storefront-event agent-text">
@@ -1869,6 +1936,29 @@ function StorefrontSection() {
                 </div>
               );
             }
+
+            // Audit step — styled as an agent console log line
+            if (ev.type === "audit_step") {
+              if (ev.done) {
+                return (
+                  <div key={i} className="audit-step-line audit-step-line--done">
+                    <span className="audit-step-arrow audit-step-arrow--done">✓</span>
+                    <span>{ev.step}</span>
+                  </div>
+                );
+              }
+              return (
+                <div key={i} className="audit-step-line">
+                  <span className="audit-step-arrow">▶</span>
+                  <span>{ev.step}</span>
+                </div>
+              );
+            }
+
+            if (ev.type === "audit_report") {
+              return <AuditReportCard key={i} auditType={ev.auditType} report={ev.report} />;
+            }
+
             if (ev.type === "final") {
               return (
                 <div key={i} className="storefront-event final">
@@ -1889,6 +1979,230 @@ function StorefrontSection() {
       )}
     </section>
   );
+}
+
+// ─── Audit Report Card ────────────────────────────────────────────────────────
+
+function scoreColor(score) {
+  if (score >= 8) return "green";
+  if (score >= 5) return "amber";
+  return "red";
+}
+
+function ScoreBar({ score }) {
+  const pct = Math.min(100, Math.max(0, (score / 10) * 100));
+  return (
+    <div className="audit-score-bar-track">
+      <div
+        className={`audit-score-bar-fill audit-score-bar-fill--${scoreColor(score)}`}
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  );
+}
+
+function AuditReportCard({ auditType, report }) {
+  if (!report || report.error) {
+    return (
+      <div className="audit-report-card audit-report-card--error">
+        <span>Audit error: {report?.error || "Unknown error"}</span>
+      </div>
+    );
+  }
+
+  if (auditType === "ux") {
+    const { overallScore, dimensions = [], topFrictions = [], topWins = [] } = report;
+    return (
+      <div className="audit-report-card">
+        <div className="audit-report-header">
+          <span className="audit-report-label">UX Audit</span>
+          <span className={`audit-score-badge audit-score-badge--${scoreColor(overallScore)}`}>
+            {overallScore}/10
+          </span>
+        </div>
+
+        <div className="audit-dimensions">
+          {dimensions.map((d, i) => (
+            <div key={i} className="audit-dimension-row">
+              <div className="audit-dimension-name">{d.name}</div>
+              <div className="audit-dimension-bar-row">
+                <ScoreBar score={d.score} />
+                <span className={`audit-dimension-score audit-dimension-score--${scoreColor(d.score)}`}>
+                  {d.score}/10
+                </span>
+              </div>
+              <p className="audit-dimension-why">{d.why}</p>
+              {d.recommendation && d.recommendation !== "None needed" && (
+                <p className="audit-dimension-rec">→ {d.recommendation}</p>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {topFrictions.length > 0 && (
+          <div className="audit-section">
+            <span className="audit-section-label audit-section-label--friction">Top Frictions</span>
+            <ul className="audit-frictions-list">
+              {topFrictions.map((f, i) => <li key={i}>{f}</li>)}
+            </ul>
+          </div>
+        )}
+
+        {topWins.length > 0 && (
+          <div className="audit-section">
+            <span className="audit-section-label audit-section-label--win">Top Wins</span>
+            <ul className="audit-wins-list">
+              {topWins.map((w, i) => <li key={i}>{w}</li>)}
+            </ul>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (auditType === "product_clarity") {
+    const { overallClarityScore, products = [], topImprovements = [] } = report;
+    return (
+      <div className="audit-report-card">
+        <div className="audit-report-header">
+          <span className="audit-report-label">Product Clarity Audit</span>
+          {overallClarityScore !== null && (
+            <span className={`audit-score-badge audit-score-badge--${scoreColor(overallClarityScore)}`}>
+              {overallClarityScore}/10
+            </span>
+          )}
+        </div>
+
+        <div className="audit-product-grid">
+          {products.map((p, i) => {
+            const scores = p.scores || {};
+            const scoreValues = Object.values(scores).filter((v) => typeof v === "number");
+            const avg = scoreValues.length
+              ? (scoreValues.reduce((a, b) => a + b, 0) / scoreValues.length).toFixed(1)
+              : null;
+            return (
+              <div key={i} className="audit-product-card">
+                <div className="audit-product-card-header">
+                  <strong className="audit-product-title">{p.productTitle}</strong>
+                  {avg && (
+                    <span className={`audit-score-badge audit-score-badge--sm audit-score-badge--${scoreColor(parseFloat(avg))}`}>
+                      {avg}
+                    </span>
+                  )}
+                </div>
+                {p.inferredAudience && (
+                  <p className="audit-product-audience">
+                    <span className="audit-product-meta-label">Audience:</span> {p.inferredAudience}
+                  </p>
+                )}
+                {p.inferredBusinessType && (
+                  <p className="audit-product-business">
+                    <span className="audit-product-meta-label">Business:</span> {p.inferredBusinessType}
+                  </p>
+                )}
+                <div className="audit-product-score-rows">
+                  {Object.entries(scores).map(([key, val]) => (
+                    <div key={key} className="audit-product-score-row">
+                      <span className="audit-product-score-key">
+                        {key.replace(/([A-Z])/g, " $1").trim()}
+                      </span>
+                      <ScoreBar score={val} />
+                      <span className={`audit-dimension-score audit-dimension-score--${scoreColor(val)}`}>
+                        {val}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                {p.missingFields?.length > 0 && (
+                  <p className="audit-product-missing">
+                    Missing: {p.missingFields.join(", ")}
+                  </p>
+                )}
+                {p.topSuggestions?.length > 0 && (
+                  <ul className="audit-product-suggestions">
+                    {p.topSuggestions.slice(0, 2).map((s, j) => <li key={j}>{s}</li>)}
+                  </ul>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {topImprovements.length > 0 && (
+          <div className="audit-section">
+            <span className="audit-section-label audit-section-label--friction">Top Improvements</span>
+            <ul className="audit-frictions-list">
+              {topImprovements.map((imp, i) => <li key={i}>{imp}</li>)}
+            </ul>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (auditType === "discoverability") {
+    const {
+      overallDiscoverabilityScore,
+      queriesTested,
+      queriesWithRecommendation,
+      neverRecommended = [],
+      queryResults = [],
+      topImprovements = [],
+    } = report;
+    const badgeColor = overallDiscoverabilityScore >= 70 ? "green" : overallDiscoverabilityScore >= 40 ? "amber" : "red";
+    return (
+      <div className="audit-report-card">
+        <div className="audit-report-header">
+          <span className="audit-report-label">Agentic Discoverability Audit</span>
+          <span className={`audit-score-badge audit-score-badge--${badgeColor}`}>
+            {overallDiscoverabilityScore}%
+          </span>
+          <span className="audit-report-sub">
+            {queriesWithRecommendation}/{queriesTested} queries matched
+          </span>
+        </div>
+
+        <div className="audit-query-list">
+          {queryResults.map((q, i) => (
+            <div key={i} className={`audit-query-row ${q.wouldRecommend ? "audit-query-row--match" : "audit-query-row--miss"}`}>
+              <span className="audit-query-icon">{q.wouldRecommend ? "✓" : "✕"}</span>
+              <div className="audit-query-content">
+                <span className="audit-query-text">"{q.query}"</span>
+                {q.wouldRecommend && q.recommendations?.length > 0 && (
+                  <span className="audit-query-match">
+                    → {q.recommendations.filter((r) => r.relevance >= 2).map((r) => r.productTitle).join(", ")}
+                  </span>
+                )}
+                {!q.wouldRecommend && q.gaps && (
+                  <span className="audit-query-gap">{q.gaps}</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {neverRecommended.length > 0 && (
+          <div className="audit-section">
+            <span className="audit-section-label audit-section-label--friction">Never Recommended</span>
+            <ul className="audit-frictions-list">
+              {neverRecommended.map((p, i) => <li key={i}>{p}</li>)}
+            </ul>
+          </div>
+        )}
+
+        {topImprovements.length > 0 && (
+          <div className="audit-section">
+            <span className="audit-section-label audit-section-label--friction">Improvements</span>
+            <ul className="audit-frictions-list">
+              {topImprovements.map((imp, i) => <li key={i}>{imp}</li>)}
+            </ul>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return null;
 }
 
 function validateDraftClient(draft) {
