@@ -131,6 +131,40 @@ async function route(req, res) {
     return
   }
 
+  const thumbMatch = url.pathname.match(/^\/api\/drive\/thumbnail\/([^/]+)$/)
+  if (req.method === 'GET' && thumbMatch) {
+    const fileId = thumbMatch[1]
+    try {
+      const token = await getAccessToken('google')
+      if (!token) { res.writeHead(401); res.end(); return }
+      const driveRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&acknowledgeAbuse=true`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      )
+      if (!driveRes.ok) { res.writeHead(driveRes.status); res.end(); return }
+      const contentType = driveRes.headers.get('content-type') || 'image/jpeg'
+      setCors(res)
+      res.writeHead(200, { 'content-type': contentType, 'cache-control': 'private, max-age=300' })
+      driveRes.body.pipeTo(new WritableStream({ write(chunk) { res.write(chunk) }, close() { res.end() } }))
+    } catch { res.writeHead(500); res.end() }
+    return
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/storefront/agent') {
+    const body = await readJson(req)
+    setCors(res)
+    res.writeHead(200, { 'content-type': 'application/x-ndjson; charset=utf-8' })
+    const emit = (obj) => res.write(JSON.stringify(obj) + '\n')
+    try {
+      await runStorefrontAgent(emit, body.message || '', body.history || [])
+    } catch (error) {
+      console.error(error)
+      emit({ type: 'final', answer: error.message || 'Unexpected error in storefront agent' })
+    }
+    res.end()
+    return
+  }
+
   sendJson(res, 404, { ok: false, error: 'Not found' })
 }
 
@@ -190,6 +224,11 @@ async function answerFromCloudFiles(emit, message, history) {
 
   if (plan.intent === 'product_create') {
     await productAgentFlow(emit, message, plan, status)
+    return
+  }
+
+  if (plan.intent === 'storefront_agent') {
+    await runStorefrontAgentForChat(emit, message, history)
     return
   }
 
@@ -315,24 +354,31 @@ async function createSearchPlan(message, history) {
       'For every user message, decide whether it requires searching the user\'s Google Drive / OneDrive files,',
       'and if so, produce search keywords.',
       '',
-      'Return ONLY compact JSON: {"intent":"chat|files|product_create","needsFiles":bool,"providers":["google","microsoft"],"queries":["kw1","kw2"],"reason":"..."}',
+      'Return ONLY compact JSON: {"intent":"chat|files|product_create|storefront_agent","needsFiles":bool,"providers":["google","microsoft"],"queries":["kw1","kw2"],"reason":"..."}',
       '',
-      'INTENT RULES:',
-      '- intent:"product_create" when the user asks to create, draft, build, add, or launch a product from a doc, brief, file, or launch document in Drive. Set needsFiles:true.',
-      '- intent:"files" when the user wants to search/read/analyze files but not create a product. Set needsFiles:true.',
-      '- intent:"chat" for everything else. Set needsFiles:false.',
+      'BIAS: When in doubt, ALWAYS prefer needsFiles=true and search. A false positive (searching when not needed) is harmless. A false negative (not searching when the user wanted Drive data) makes you useless.',
+      '',
+      'INTENT RULES (in priority order):',
+      '- intent:"storefront_agent" when the user wants to publish, upload, push, or add something to their live website/store/storefront WITHOUT asking to scan Drive for a new doc first. Also covers: audit store, change theme, create pages/collections, delete/unpublish products, "publish it", "add it to my store", "upload it to my website". Set needsFiles:false.',
+      '  KEY: if the conversation already has a product draft and the user says "publish it", "upload it", "add it to my site/store/website" → ALWAYS storefront_agent.',
+      '  Triggers: "publish it", "upload it to my website", "add it to my store", "push it live", "audit my store", "update theme", "create a page", "create a collection", "list my pages", "publish all products", "show me my store", "make changes to the storefront".',
+      '- intent:"product_create" ONLY when the user explicitly asks to SCAN Drive / find a doc / create a NEW product from scratch with no prior context. Set needsFiles:true.',
+      '  Triggers: "scan for new product", "find a product doc", "create product from drive", "scan storefront ideas", "scan and upload".',
+      '  DO NOT use product_create if the user is referring to something already shown in the conversation.',
+      '- intent:"files" when the user wants to search, read, browse, or analyze files but not create a product. Set needsFiles:true.',
+      '  Triggers: "drive" alone, "check my files", "what\'s in my drive", "show me my docs", vague file references.',
+      '- intent:"chat" ONLY for: pure greetings ("hi", "hello"), pure chit-chat ("how are you"), or questions answerable entirely from general knowledge with zero need for the user\'s personal files.',
       '',
       'ROUTING — when needsFiles=true:',
-      '- The message asks about the user\'s own data, files, documents, spreadsheets, reports, or numbers.',
-      '- The message references things only findable in their personal storage ("my sales", "our roadmap", "the Q1 report", "the deck I made", named files).',
-      '- The message asks to summarize/analyze/look up something specific.',
-      '- The user wants to create a product from a Drive doc (intent:product_create).',
+      '- ANY mention of "drive", "docs", "files", "my data", "my store", "my products", "my sales", "our roadmap", named files, or personal storage.',
+      '- Action verbs aimed at the storefront: scan, upload, sync, publish, create, draft, add.',
+      '- Requests to summarize, analyze, find, look up, or report on anything specific.',
+      '- VAGUE messages that could relate to Drive (e.g. just "drive", "show me", "what do I have").',
       '',
-      'ROUTING — when needsFiles=false:',
-      '- Greetings or chit-chat ("hi", "hello", "thanks", "how are you").',
-      '- Generic questions about Shopify or e-commerce concepts that don\'t need user data.',
-      '- Meta questions about the assistant ("what can you do?").',
-      '- Anything that can be answered without reading a file.',
+      'ROUTING — when needsFiles=false (VERY restrictive):',
+      '- Pure greetings with no action intent ("hi", "hello", "thanks", "how are you").',
+      '- Purely hypothetical or educational Shopify questions with zero reference to the user\'s own store or files.',
+      '- Meta questions about the assistant only ("what can you do?").',
       'When needsFiles=false, return queries:[] and providers:[].',
       '',
       'QUERY RULES (only matter when needsFiles=true; the API does literal substring matching):',
@@ -342,6 +388,7 @@ async function createSearchPlan(message, history) {
       '- Output 3-5 candidate keywords covering different angles: the topic, distinctive nouns the user said, likely file-name fragments, related synonyms.',
       '- The user may NOT name a file. Infer keywords from the topic. Example: "what was my Q1 revenue?" -> ["revenue","sales","Q1","quarterly","financial"].',
       '- If the user does name a file, include that name AND 2-3 fallback keywords from the rest of the question.',
+      '- For vague Drive browse requests (e.g. "drive" alone), use discovery keywords: ["product","sales","report","inventory","launch"].',
       '',
       'PROVIDER RULES:',
       '- Default to both ["google","microsoft"] unless the user explicitly names one.',
@@ -349,11 +396,24 @@ async function createSearchPlan(message, history) {
       'Examples:',
       'User: "hello" -> {"intent":"chat","needsFiles":false,"providers":[],"queries":[],"reason":"greeting"}',
       'User: "what can you do?" -> {"intent":"chat","needsFiles":false,"providers":[],"queries":[],"reason":"meta question"}',
+      'User: "drive" -> {"intent":"files","needsFiles":true,"providers":["google","microsoft"],"queries":["product","sales","report","inventory","launch"],"reason":"user wants to browse Drive"}',
       'User: "what is in my Sidekick Test Sale sheet?" -> {"intent":"files","needsFiles":true,"providers":["google","microsoft"],"queries":["Sidekick","Test Sale","Sidekick Test"],"reason":"named file plus fallbacks"}',
       'User: "summarize my recent sales numbers" -> {"intent":"files","needsFiles":true,"providers":["google","microsoft"],"queries":["sales","revenue","quarterly","report"],"reason":"topic keywords for discovery"}',
       'User: "what is a good discount strategy for new customers?" -> {"intent":"chat","needsFiles":false,"providers":[],"queries":[],"reason":"general advice, no user data needed"}',
+      'User: "scan for new product and upload to storefront" -> {"intent":"product_create","needsFiles":true,"providers":["google","microsoft"],"queries":["product","launch","brief","new","storefront"],"reason":"scan Drive for product brief and publish"}',
       'User: "create a product from the StormLite launch doc" -> {"intent":"product_create","needsFiles":true,"providers":["google","microsoft"],"queries":["StormLite","launch","product brief","StormLite launch"],"reason":"product creation from Drive doc"}',
       'User: "draft a product from my jacket brief in Drive" -> {"intent":"product_create","needsFiles":true,"providers":["google","microsoft"],"queries":["jacket","brief","launch","product"],"reason":"product creation from Drive doc"}',
+      'User: "scan storefront ideas doc" -> {"intent":"product_create","needsFiles":true,"providers":["google","microsoft"],"queries":["storefront","ideas","product","brief"],"reason":"scan a doc for product/storefront ideas"}',
+      'User: "audit my store" -> {"intent":"storefront_agent","needsFiles":false,"providers":[],"queries":[],"reason":"storefront audit request"}',
+      'User: "publish it" -> {"intent":"storefront_agent","needsFiles":false,"providers":[],"queries":[],"reason":"follow-up publish action"}',
+      'User: "upload it to my website" -> {"intent":"storefront_agent","needsFiles":false,"providers":[],"queries":[],"reason":"follow-up upload to storefront"}',
+      'User: "no, i want you to upload it to my website" -> {"intent":"storefront_agent","needsFiles":false,"providers":[],"queries":[],"reason":"user wants storefront publish not another Drive scan"}',
+      'User: "add it to my store" -> {"intent":"storefront_agent","needsFiles":false,"providers":[],"queries":[],"reason":"follow-up store publish"}',
+      'User: "push it live" -> {"intent":"storefront_agent","needsFiles":false,"providers":[],"queries":[],"reason":"follow-up publish to storefront"}',
+      'User: "create a Summer Sale collection" -> {"intent":"storefront_agent","needsFiles":false,"providers":[],"queries":[],"reason":"collection creation — store-level operation"}',
+      'User: "what pages do I have?" -> {"intent":"storefront_agent","needsFiles":false,"providers":[],"queries":[],"reason":"listing store pages"}',
+      'User: "publish all my draft products" -> {"intent":"storefront_agent","needsFiles":false,"providers":[],"queries":[],"reason":"publishing products — store-level operation"}',
+      'User: "update my theme colors" -> {"intent":"storefront_agent","needsFiles":false,"providers":[],"queries":[],"reason":"theme modification"}',
     ].join('\n'),
     messages: [
       ...history.slice(-4).map((entry) => ({
@@ -377,7 +437,6 @@ async function chatReply(message, history) {
       'You are Sidekick, a friendly Shopify assistant.',
       'Reply conversationally and concisely in plain text. No JSON, no markdown headers.',
       'You can answer general questions about Shopify, e-commerce, and have casual chat.',
-      'If the user asks about their specific data, files, or numbers, tell them to ask a question that names what they want (e.g. "summarize my Q1 sales") so you can search their connected Drive.',
       'Keep replies under 4 sentences unless the user asks for detail.',
     ].join('\n'),
     messages: [
@@ -541,10 +600,11 @@ async function searchDriveImagesGlobal(productTitle, fallbackQueries) {
   }
 }
 
-function rankAndSelectImages(images, productTitle) {
+async function rankAndSelectImages(images, productTitle, productDescription) {
   const titleWords = productTitle.toLowerCase().split(/\s+/).filter((w) => w.length > 2)
 
-  const scored = images.map((img) => {
+  // Heuristic pre-score
+  const prescored = images.map((img) => {
     const nameLower = img.name.toLowerCase()
     let score = 0
     for (const kw of IMAGE_HERO_KEYWORDS) {
@@ -557,14 +617,54 @@ function rankAndSelectImages(images, productTitle) {
   })
 
   const seen = new Set()
-  return scored
+  const candidates = prescored
     .filter((img) => {
       if (seen.has(img.id)) return false
       seen.add(img.id)
       return true
     })
     .sort((a, b) => b._score - a._score)
-    .slice(0, 3)
+    .slice(0, 8) // gather more before AI filtering
+
+  if (!candidates.length) return []
+
+  // AI validation: ask Haiku which images actually match this product
+  try {
+    const imageList = candidates.map((img, i) => `${i + 1}. "${img.name}"`).join('\n')
+    const aiResponse = await callAnthropicReasoning({
+      system: `You are an image relevance validator for an e-commerce product upload system.
+Given a product title, optional description, and a list of image filenames from Google Drive,
+decide which images actually depict or directly relate to this product.
+Return ONLY a JSON array of the 1-indexed positions that are relevant, e.g. [1,3].
+If none match, return []. No explanation — only the JSON array.`,
+      messages: [
+        {
+          role: 'user',
+          content: `Product title: "${productTitle}"
+${productDescription ? `Product description: "${productDescription.slice(0, 300)}"` : ''}
+
+Image filenames:
+${imageList}
+
+Which image numbers actually match this product?`,
+        },
+      ],
+      maxTokens: 200,
+    })
+
+    const match = aiResponse.match(/\[[\d,\s]*\]/)
+    if (match) {
+      const kept = JSON.parse(match[0])
+      if (Array.isArray(kept) && kept.length > 0) {
+        const filtered = kept.map((i) => candidates[i - 1]).filter(Boolean).slice(0, 3)
+        if (filtered.length > 0) return filtered
+      }
+    }
+  } catch {
+    // fall through to heuristic result
+  }
+
+  return candidates.slice(0, 3)
 }
 
 function driveImageToMediaDraft(image) {
@@ -575,11 +675,10 @@ function driveImageToMediaDraft(image) {
     sourceFileName: image.name,
     driveFileId: image.id,
     thumbnailLink: image.thumbnailLink || null,
-    isPrivateWarning: true,
   }
 }
 
-async function findDriveImagesForProduct(sourceFile, productTitle, fallbackQueries) {
+async function findDriveImagesForProduct(sourceFile, productTitle, fallbackQueries, productDescription) {
   try {
     let images = []
 
@@ -594,7 +693,8 @@ async function findDriveImagesForProduct(sourceFile, productTitle, fallbackQueri
       images = await searchDriveImagesGlobal(productTitle, fallbackQueries)
     }
 
-    return rankAndSelectImages(images, productTitle).map(driveImageToMediaDraft)
+    const ranked = await rankAndSelectImages(images, productTitle, productDescription)
+    return ranked.map(driveImageToMediaDraft)
   } catch {
     return []
   }
@@ -683,6 +783,44 @@ async function callAnthropic({ system, messages, maxTokens }) {
 
   const data = await response.json()
   return data.content?.map((block) => block.text || '').join('\n').trim() || ''
+}
+
+// Uses claude-opus-4-7 with adaptive thinking + prompt caching for high-stakes reasoning.
+// System prompt is cached so repeated calls (rerank, extract) don't re-process the large prompt.
+async function callAnthropicReasoning({ system, messages, maxTokens }) {
+  if (!process.env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY missing')
+
+  // Cache the system prompt — stable across calls, saves tokens on repeated reranks
+  const systemBlocks = [
+    {
+      type: 'text',
+      text: system,
+      cache_control: { type: 'ephemeral' },
+    },
+  ]
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'prompt-caching-2024-07-31',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5',
+      max_tokens: maxTokens,
+      system: systemBlocks,
+      messages,
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Anthropic reasoning API failed: ${response.status} ${await response.text()}`)
+  }
+
+  const data = await response.json()
+  return data.content?.map((b) => b.text || '').join('\n').trim() || ''
 }
 
 async function getAccessToken(provider) {
@@ -823,6 +961,131 @@ function setCors(res) {
 
 // ─── Product Launch Agent ────────────────────────────────────────────────────
 
+async function rerankForProductCreate(message, candidates) {
+  const DEV_NAME = /changelog|readme|package|license|contributing|config|setup|install|makefile|dockerfile|gruntfile|gemfile|procfile/i
+  const DEV_EXT = /\.(md|json|js|ts|jsx|tsx|py|rb|go|java|css|html|xml|yaml|yml|lock|log|sh|env|toml|ini|cfg)$/i
+  // "project" in name = planning/meta doc, not a product brief
+  const META_NAME = /project|roadmap|strategy|proposal|planning|vision|sprint|backlog|milestone|saas|app\s*idea/i
+  const STOREFRONT_NAME = /storefront|store\s*front/i
+  const PRODUCT_BRIEF_NAME = /product\s*(brief|idea|ideas|launch|listing)|brief|launch\s*doc|product\s*spec/i
+  const PRICE_IN_TEXT = /\$\s*\d+|\d+\s*(dollars?|USD|per\s+\w+)/i
+  const PRODUCT_ITEM_TEXT = /add\s+\w+\s+product|new\s+product|item\s+to\s+(add|list|sell)|price\s+it\s+at/i
+
+  const scored = candidates.map((file) => {
+    let score = 0
+    const name = file.name || ''
+    const mime = file.mimeType || ''
+    const snippet = (file.text || '').slice(0, 800)
+
+    // File type scoring
+    if (mime === 'application/vnd.google-apps.document') score += 15
+    else if (mime === 'application/vnd.google-apps.spreadsheet') score += 8
+    else if (DEV_EXT.test(name)) score -= 25
+    else if (mime.startsWith('text/plain')) score -= 5
+
+    // Name: developer files → hard penalize
+    if (DEV_NAME.test(name)) score -= 30
+
+    // Name: meta/project docs → penalize (not product briefs)
+    if (META_NAME.test(name)) score -= 20
+
+    // Name: storefront-specific → strong boost
+    if (STOREFRONT_NAME.test(name)) score += 18
+
+    // Name: looks like a product brief → boost
+    if (PRODUCT_BRIEF_NAME.test(name)) score += 14
+
+    // Name: has "ideas" without "project" → moderate boost
+    if (/ideas?/i.test(name) && !META_NAME.test(name)) score += 8
+
+    // Content: price mentioned → very strong signal this has a real product
+    if (PRICE_IN_TEXT.test(snippet)) score += 20
+
+    // Content: "add X product", "new product", "price it at" → strongest content signal
+    if (PRODUCT_ITEM_TEXT.test(snippet)) score += 25
+
+    // Content: dev/changelog signals → penalize
+    if (/changelog|version\s*\d|bug\s*fix|release\s*notes|commit|pull\s*request/i.test(snippet)) score -= 20
+
+    // Content: SaaS/tech project language → penalize
+    if (/saas|api\s+endpoint|microservice|database\s+schema|deployment|kubernetes|docker/i.test(snippet)) score -= 15
+
+    // Recency bonus
+    if (file.modifiedTime) {
+      const days = (Date.now() - new Date(file.modifiedTime).getTime()) / 86400000
+      if (days < 1) score += 8
+      else if (days < 7) score += 4
+      else if (days < 30) score += 1
+    }
+
+    return { ...file, _hScore: score }
+  })
+
+  scored.sort((a, b) => b._hScore - a._hScore)
+
+  // If top candidate is clearly dominant (score gap > 15), trust heuristics alone
+  if (scored.length > 1 && scored[0]._hScore - scored[1]._hScore > 15) return scored
+
+  // LLM validation over top 6 when scores are close
+  const top = scored.slice(0, 6)
+  if (top.length <= 1 || !process.env.ANTHROPIC_API_KEY) return scored
+
+  const summaries = top.map((file, i) => ({
+    index: i,
+    name: file.name,
+    mimeType: file.mimeType,
+    modifiedTime: file.modifiedTime,
+    heuristicScore: file._hScore,
+    snippet: (file.text || '').slice(0, 500).replace(/\s+/g, ' ').trim(),
+  }))
+
+  const text = await callAnthropicReasoning({
+    system: [
+      'You are selecting the ONE document that contains specific retail products to add to a Shopify storefront.',
+      'The ideal document has: a list of physical/digital products to sell, their prices, and descriptions.',
+      '',
+      'CRITICAL DISTINCTIONS:',
+      '- "Storefront Ideas" = ideas for products to sell → CORRECT (this is a product brief)',
+      '- "Shopify Project Ideas" = a planning doc for a software project → WRONG (this is a meta doc)',
+      '- A doc saying "Add water bottle, price $20" → CORRECT (concrete product to create)',
+      '- A doc about SaaS features, APIs, or app architecture → WRONG (not a product brief)',
+      '',
+      'STRONGLY PREFER:',
+      '- Google Docs with product names, prices ($X), or "add [item]" instructions',
+      '- Names like "Storefront Ideas", "Product Brief", "New Products", "Product Launch"',
+      '- Content that looks like a merchant\'s product wishlist or product spec',
+      '',
+      'STRONGLY AVOID:',
+      '- "Project Ideas" docs — these are feature/project planning, not product briefs',
+      '- CHANGELOG.md, README.md, technical docs, code files',
+      '- Docs about SaaS, APIs, apps, or software development',
+      '',
+      'Think carefully about the file names and content snippets before ranking.',
+      'Return ONLY JSON: {"order":[0,1,2,...]} — best product brief first. Include every index exactly once.',
+    ].join('\n'),
+    messages: [{ role: 'user', content: JSON.stringify({ userRequest: message, candidates: summaries }) }],
+    maxTokens: 3000,
+  })
+
+  const parsed = parseJson(text, null)
+  if (!parsed?.order || !Array.isArray(parsed.order)) return scored
+
+  const seen = new Set()
+  const ordered = []
+  for (const i of parsed.order) {
+    if (Number.isInteger(i) && i >= 0 && i < top.length && !seen.has(i)) {
+      ordered.push(top[i])
+      seen.add(i)
+    }
+  }
+  for (let i = 0; i < top.length; i++) {
+    if (!seen.has(i)) ordered.push(top[i])
+  }
+  for (const file of scored.slice(6)) ordered.push(file)
+
+  return ordered
+}
+
 async function productAgentFlow(emit, message, plan, status) {
   if (!status.google && !status.microsoft) {
     emit({
@@ -841,9 +1104,13 @@ async function productAgentFlow(emit, message, plan, status) {
     : ['google', 'microsoft'].filter((p) => status[p])
   const queries = plan.queries?.length ? plan.queries.slice(0, 5) : [message]
 
+  // Also always search for "product" + "ideas" + "brief" + "storefront" to cast a wide net
+  const discoveryQueries = ['product ideas', 'product brief', 'storefront ideas', 'new product', 'product launch']
+  const allQueries = [...new Set([...queries, ...discoveryQueries])]
+
   const results = []
   for (const provider of providerNames) {
-    for (const query of queries) {
+    for (const query of allQueries.slice(0, 8)) {
       const found = provider === 'google'
         ? await searchGoogleDrive(query)
         : await searchMicrosoftDrive(query)
@@ -851,8 +1118,8 @@ async function productAgentFlow(emit, message, plan, status) {
     }
   }
 
-  const candidates = dedupeFiles(results)
-  if (candidates.length === 0) {
+  const deduped = dedupeFiles(results)
+  if (deduped.length === 0) {
     emit({
       type: 'final',
       display: {
@@ -864,8 +1131,16 @@ async function productAgentFlow(emit, message, plan, status) {
     return
   }
 
-  const sourceFile = candidates[0]
-  const docText = await readFileText(sourceFile)
+  // Read content for top candidates so the reranker can see what's inside
+  const withText = await Promise.all(
+    deduped.slice(0, 15).map(async (file) => ({ ...file, text: await readFileText(file) })),
+  )
+
+  const ranked = await rerankForProductCreate(message, withText)
+  emit({ type: 'rerank', candidates: withText.length, kept: 1 })
+
+  const sourceFile = ranked[0]
+  const docText = sourceFile.text || await readFileText(sourceFile)
 
   if (!process.env.ANTHROPIC_API_KEY) {
     emit({
@@ -893,7 +1168,7 @@ async function productAgentFlow(emit, message, plan, status) {
   }
 
   // Search for product images in the same Drive folder (or globally as fallback)
-  const imageMedia = await findDriveImagesForProduct(sourceFile, draft.title, plan.queries || [])
+  const imageMedia = await findDriveImagesForProduct(sourceFile, draft.title, plan.queries || [], draft.description)
   if (imageMedia.length) {
     draft.media = imageMedia
     // Remove any "Missing product images" warning since we found some
@@ -908,7 +1183,7 @@ async function productAgentFlow(emit, message, plan, status) {
   }
 
   const validation = validateProductDraft(draft)
-  const noteMultiple = candidates.length > 1 ? ` (${candidates.length - 1} other doc${candidates.length > 2 ? 's' : ''} found — using the most relevant one)` : ''
+  const noteMultiple = ranked.length > 1 ? ` (${ranked.length - 1} other doc${ranked.length > 2 ? 's' : ''} found — using the most relevant one)` : ''
   const imageNote = imageMedia.length ? ` Found ${imageMedia.length} image${imageMedia.length > 1 ? 's' : ''} in Drive.` : ''
   const answer = validation.valid
     ? `I found "${sourceFile.name}" in your Google Drive${noteMultiple} and extracted a product draft for "${draft.title}".${imageNote} Review the details below and click Create Draft Product to add it to your store.`
@@ -927,7 +1202,7 @@ async function productAgentFlow(emit, message, plan, status) {
 }
 
 async function extractAndGenerateDraft(docText) {
-  const text = await callAnthropic({
+  const text = await callAnthropicReasoning({
     system: [
       'You extract product data from a launch brief and return a Shopify product draft as compact JSON only.',
       'Return ONLY a valid JSON object — no markdown, no explanation.',
@@ -958,7 +1233,7 @@ async function extractAndGenerateDraft(docText) {
       '- Return ONLY the JSON object, no markdown, no code fences.',
     ].join('\n'),
     messages: [{ role: 'user', content: docText.slice(0, 10000) }],
-    maxTokens: 1800,
+    maxTokens: 4000,
   })
 
   return parseJson(text, null)
@@ -1070,6 +1345,71 @@ async function shopifyAdminGraphQL(query, variables = {}) {
   return json.data
 }
 
+const STAGED_UPLOAD_MUTATION = `
+  mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+    stagedUploadsCreate(input: $input) {
+      stagedTargets {
+        url
+        resourceUrl
+        parameters { name value }
+      }
+      userErrors { field message }
+    }
+  }
+`
+
+async function stageAndUploadDriveImages(mediaItems) {
+  const token = await getAccessToken('google')
+  if (!token || !mediaItems.length) return []
+
+  const results = []
+  for (const item of mediaItems) {
+    try {
+      const driveRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${item.driveFileId}?alt=media`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      )
+      if (!driveRes.ok) continue
+
+      const imageBuffer = await driveRes.arrayBuffer()
+      const mimeType = (driveRes.headers.get('content-type') || 'image/jpeg').split(';')[0].trim()
+
+      // Always derive extension from actual MIME to avoid Shopify "extension doesn't match format" error
+      const MIME_TO_EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' }
+      const ext = MIME_TO_EXT[mimeType] || 'jpg'
+      const baseName = (item.sourceFileName || 'product-image').replace(/\.[^.]+$/, '')
+      const filename = `${baseName}.${ext}`
+
+      const stagedData = await shopifyAdminGraphQL(STAGED_UPLOAD_MUTATION, {
+        input: [{
+          filename,
+          mimeType,
+          resource: 'IMAGE',
+          httpMethod: 'POST',
+          fileSize: String(imageBuffer.byteLength),
+        }],
+      })
+
+      const target = stagedData?.stagedUploadsCreate?.stagedTargets?.[0]
+      if (!target) continue
+
+      const formData = new FormData()
+      for (const param of target.parameters) {
+        formData.append(param.name, param.value)
+      }
+      formData.append('file', new Blob([imageBuffer], { type: mimeType }), filename)
+
+      const uploadRes = await fetch(target.url, { method: 'POST', body: formData })
+      if (!uploadRes.ok) continue
+
+      results.push({ originalSource: target.resourceUrl, mediaContentType: 'IMAGE', alt: item.alt || null })
+    } catch {
+      // skip failed image
+    }
+  }
+  return results
+}
+
 const PRODUCT_CREATE_MUTATION = `
   mutation productCreate($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
     productCreate(product: $product, media: $media) {
@@ -1079,6 +1419,9 @@ const PRODUCT_CREATE_MUTATION = `
         status
         handle
         onlineStorePreviewUrl
+        variants(first: 1) {
+          nodes { id }
+        }
         media(first: 5) {
           nodes {
             id
@@ -1096,6 +1439,45 @@ const PRODUCT_CREATE_MUTATION = `
   }
 `
 
+const VARIANT_PRICE_MUTATION = `
+  mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+    productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+      productVariants { id price }
+      userErrors { field message }
+    }
+  }
+`
+
+function buildProductResult(p) {
+  const numericId = p.id.replace('gid://shopify/Product/', '')
+  const storeDomain = process.env.SHOPIFY_STORE_DOMAIN || ''
+  const storeSlug = storeDomain.replace('.myshopify.com', '')
+  return {
+    id: p.id,
+    numericId,
+    title: p.title,
+    status: p.status,
+    handle: p.handle,
+    adminUrl: `https://admin.shopify.com/store/${storeSlug}/products/${numericId}`,
+    previewUrl: p.onlineStorePreviewUrl || null,
+    media: p.media?.nodes || [],
+  }
+}
+
+async function setVariantPrice(product, priceStr) {
+  if (!priceStr || isNaN(parseFloat(priceStr))) return
+  const variantId = product?.variants?.nodes?.[0]?.id
+  if (!variantId) return
+  try {
+    await shopifyAdminGraphQL(VARIANT_PRICE_MUTATION, {
+      productId: product.id,
+      variants: [{ id: variantId, price: priceStr }],
+    })
+  } catch {
+    // non-fatal — product still created
+  }
+}
+
 async function createShopifyDraftProduct(draft) {
   if (!draft?.title) {
     return { success: false, errors: [{ field: 'title', message: 'title is required' }] }
@@ -1105,21 +1487,29 @@ async function createShopifyDraftProduct(draft) {
     return { success: false, errors: [{ field: null, message: 'Shopify Admin API is not configured on this server.' }] }
   }
 
-  const input = { status: 'DRAFT' }
+  const input = { status: draft.status === 'ACTIVE' ? 'ACTIVE' : 'DRAFT' }
   if (draft.title) input.title = String(draft.title).trim()
   if (draft.descriptionHtml) input.descriptionHtml = String(draft.descriptionHtml)
   if (draft.vendor) input.vendor = String(draft.vendor)
   if (draft.productType) input.productType = String(draft.productType)
   if (Array.isArray(draft.tags) && draft.tags.length) input.tags = draft.tags
 
-  // Map draft.media -> Shopify CreateMediaInput[]
-  const mediaInput = (draft.media || [])
-    .filter((m) => m.originalSource && m.mediaContentType)
-    .map((m) => ({
-      originalSource: m.originalSource,
-      mediaContentType: m.mediaContentType,
-      alt: m.alt || null,
-    }))
+  // Price is applied after creation via productVariantsBulkUpdate (not supported in ProductCreateInput)
+  const priceStr = draft.price
+    ? parseFloat(String(draft.price).replace(/[^0-9.]/g, '')).toFixed(2)
+    : null
+
+  // Stage and upload Drive images so Shopify can fetch them
+  const stagedMedia = await stageAndUploadDriveImages(
+    (draft.media || []).filter((m) => m.driveFileId),
+  )
+
+  // Fall back to direct URL for any items without a driveFileId
+  const directMedia = (draft.media || [])
+    .filter((m) => !m.driveFileId && m.originalSource && m.mediaContentType)
+    .map((m) => ({ originalSource: m.originalSource, mediaContentType: m.mediaContentType, alt: m.alt || null }))
+
+  const mediaInput = [...stagedMedia, ...directMedia]
 
   try {
     const variables = { product: input }
@@ -1133,42 +1523,30 @@ async function createShopifyDraftProduct(draft) {
     }
 
     if (result.userErrors?.length) {
-      // Surface media-specific errors clearly
       const mediaErrors = result.userErrors.filter((e) =>
         e.field?.includes('media') || e.message?.toLowerCase().includes('media') || e.message?.toLowerCase().includes('image'),
       )
       const otherErrors = result.userErrors.filter((e) => !mediaErrors.includes(e))
-
       if (otherErrors.length) {
         return { success: false, errors: result.userErrors }
       }
+      // Product created but media failed — still set price then return
+      await setVariantPrice(result.product, priceStr)
+      return { success: true, mediaErrors, product: buildProductResult(result.product) }
+    }
 
-      // Product was created but media failed — return success with mediaErrors
-      return {
-        success: true,
-        mediaErrors,
-        product: {
-          id: result.product.id,
-          title: result.product.title,
-          status: result.product.status,
-          handle: result.product.handle,
-          previewUrl: result.product.onlineStorePreviewUrl || null,
-          media: result.product.media?.nodes || [],
-        },
-      }
+    // Set price on the default variant via a separate mutation
+    await setVariantPrice(result.product, priceStr)
+
+    // Publish to the Online Store channel so it appears on the storefront
+    if (draft.status === 'ACTIVE') {
+      try { await publishToOnlineStore(result.product.id) } catch { /* non-fatal */ }
     }
 
     return {
       success: true,
       mediaErrors: [],
-      product: {
-        id: result.product.id,
-        title: result.product.title,
-        status: result.product.status,
-        handle: result.product.handle,
-        previewUrl: result.product.onlineStorePreviewUrl || null,
-        media: result.product.media?.nodes || [],
-      },
+      product: buildProductResult(result.product),
     }
   } catch (error) {
     return { success: false, errors: [{ field: null, message: error.message }] }
@@ -1190,6 +1568,741 @@ function mapProductDraftToShopifyGraphQLInput(draft) {
     // TODO: metafields
     // TODO: media
   }
+}
+
+// ─── Storefront Auditor ───────────────────────────────────────────────────────
+
+async function shopifyRest(method, path, body) {
+  if (!isShopifyConfigured()) throw new Error('Shopify not configured')
+  const { SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_ACCESS_TOKEN, SHOPIFY_API_VERSION } = process.env
+  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}${path}`
+  const options = {
+    method,
+    headers: {
+      'content-type': 'application/json',
+      'x-shopify-access-token': SHOPIFY_ADMIN_ACCESS_TOKEN,
+    },
+  }
+  if (body && (method === 'POST' || method === 'PUT')) {
+    options.body = JSON.stringify(body)
+  }
+  const response = await fetch(url, options)
+  if (!response.ok) {
+    const text = await response.text()
+    throw new Error(`Shopify REST ${method} ${path} failed: ${response.status} ${text.slice(0, 300)}`)
+  }
+  return response.json()
+}
+
+async function toolGetStorefrontAudit() {
+  const results = {}
+
+  // Fetch products via GraphQL
+  try {
+    const data = await shopifyAdminGraphQL(`
+      {
+        products(first: 10) {
+          nodes {
+            id
+            title
+            status
+            handle
+            priceRangeV2 {
+              minVariantPrice { amount currencyCode }
+            }
+            totalInventory
+          }
+        }
+      }
+    `)
+    results.products = data?.products?.nodes || []
+  } catch (err) {
+    results.productsError = err.message
+  }
+
+  // Fetch pages via REST
+  try {
+    const pagesData = await shopifyRest('GET', '/pages.json?limit=10')
+    results.pages = (pagesData.pages || []).map((p) => ({
+      id: p.id,
+      title: p.title,
+      handle: p.handle,
+      published: p.published_at !== null,
+    }))
+  } catch (err) {
+    results.pagesError = err.message
+  }
+
+  // Fetch active theme settings summary
+  try {
+    const settings = await toolGetThemeSettings()
+    results.themeSettings = settings
+      ? { fetched: true, colorSchemeCount: Object.keys(settings.current || {}).length }
+      : { fetched: false }
+  } catch (err) {
+    results.themeSettingsError = err.message
+  }
+
+  return results
+}
+
+async function toolGetThemeSettings() {
+  if (!isShopifyConfigured()) throw new Error('Shopify not configured')
+  const { SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_ACCESS_TOKEN, SHOPIFY_API_VERSION } = process.env
+
+  // Get active theme id
+  const themesUrl = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/themes.json`
+  const themesRes = await fetch(themesUrl, {
+    headers: { 'x-shopify-access-token': SHOPIFY_ADMIN_ACCESS_TOKEN },
+  })
+  if (!themesRes.ok) throw new Error(`Could not fetch themes: ${themesRes.status}`)
+  const themesData = await themesRes.json()
+  const activeTheme = (themesData.themes || []).find((t) => t.role === 'main')
+  if (!activeTheme) throw new Error('No active theme found')
+
+  const assetUrl = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/themes/${activeTheme.id}/assets.json?asset[key]=config/settings_data.json`
+  const assetRes = await fetch(assetUrl, {
+    headers: { 'x-shopify-access-token': SHOPIFY_ADMIN_ACCESS_TOKEN },
+  })
+  if (!assetRes.ok) throw new Error(`Could not fetch settings_data.json: ${assetRes.status}`)
+  const assetData = await assetRes.json()
+  const rawValue = assetData?.asset?.value
+  if (!rawValue) throw new Error('settings_data.json value is empty')
+  return parseJson(rawValue, {})
+}
+
+async function toolUpdateThemeSettings(updates) {
+  if (!isShopifyConfigured()) throw new Error('Shopify not configured')
+  const { SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_ACCESS_TOKEN, SHOPIFY_API_VERSION } = process.env
+
+  // Get active theme id
+  const themesUrl = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/themes.json`
+  const themesRes = await fetch(themesUrl, {
+    headers: { 'x-shopify-access-token': SHOPIFY_ADMIN_ACCESS_TOKEN },
+  })
+  if (!themesRes.ok) throw new Error(`Could not fetch themes: ${themesRes.status}`)
+  const themesData = await themesRes.json()
+  const activeTheme = (themesData.themes || []).find((t) => t.role === 'main')
+  if (!activeTheme) throw new Error('No active theme found')
+
+  // Read current settings
+  const current = await toolGetThemeSettings()
+
+  // Deep merge updates into current
+  function deepMerge(target, source) {
+    const result = { ...target }
+    for (const key of Object.keys(source)) {
+      if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+        result[key] = deepMerge(target[key] || {}, source[key])
+      } else {
+        result[key] = source[key]
+      }
+    }
+    return result
+  }
+  const merged = deepMerge(current, updates)
+
+  // Write back
+  const putUrl = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/themes/${activeTheme.id}/assets.json`
+  const putRes = await fetch(putUrl, {
+    method: 'PUT',
+    headers: {
+      'content-type': 'application/json',
+      'x-shopify-access-token': SHOPIFY_ADMIN_ACCESS_TOKEN,
+    },
+    body: JSON.stringify({ asset: { key: 'config/settings_data.json', value: JSON.stringify(merged) } }),
+  })
+  if (!putRes.ok) {
+    const text = await putRes.text()
+    throw new Error(`Could not update settings_data.json: ${putRes.status} ${text.slice(0, 200)}`)
+  }
+  return { updated: true }
+}
+
+async function toolGetPages() {
+  const data = await shopifyRest('GET', '/pages.json?limit=25')
+  return (data.pages || []).map((p) => ({
+    id: p.id,
+    title: p.title,
+    handle: p.handle,
+    body_html: p.body_html,
+    published: p.published_at !== null,
+    created_at: p.created_at,
+  }))
+}
+
+async function toolCreateOrUpdatePage({ id, title, body_html, handle, published }) {
+  if (id) {
+    const data = await shopifyRest('PUT', `/pages/${id}.json`, {
+      page: { id, title, body_html, handle, published },
+    })
+    return data.page
+  }
+  const data = await shopifyRest('POST', '/pages.json', {
+    page: { title, body_html, handle, published: published ?? true },
+  })
+  return data.page
+}
+
+async function toolGetMenus() {
+  const data = await shopifyAdminGraphQL(`
+    {
+      menus(first: 10) {
+        nodes {
+          id
+          title
+          handle
+          items {
+            title
+            url
+          }
+        }
+      }
+    }
+  `)
+  return data?.menus?.nodes || []
+}
+
+async function toolCreateCollection({ title, descriptionHtml, published }) {
+  const data = await shopifyAdminGraphQL(
+    `
+    mutation collectionCreate($input: CollectionInput!) {
+      collectionCreate(input: $input) {
+        collection {
+          id
+          title
+          handle
+        }
+        userErrors { field message }
+      }
+    }
+  `,
+    { input: { title, descriptionHtml, published: published ?? true } },
+  )
+  const result = data?.collectionCreate
+  if (result?.userErrors?.length) {
+    throw new Error(result.userErrors.map((e) => e.message).join('; '))
+  }
+  return result?.collection
+}
+
+async function toolPublishProduct(productId) {
+  const gid = productId.startsWith('gid://') ? productId : `gid://shopify/Product/${productId}`
+  const data = await shopifyAdminGraphQL(
+    `
+    mutation productUpdate($input: ProductInput!) {
+      productUpdate(input: $input) {
+        product { id title status }
+        userErrors { field message }
+      }
+    }
+  `,
+    { input: { id: gid, status: 'ACTIVE' } },
+  )
+  const result = data?.productUpdate
+  if (result?.userErrors?.length) {
+    throw new Error(result.userErrors.map((e) => e.message).join('; '))
+  }
+  // Also publish to the Online Store sales channel so it appears on the storefront
+  try { await publishToOnlineStore(gid) } catch { /* non-fatal */ }
+  return result?.product
+}
+
+let _onlineStorePublicationId = null
+async function publishToOnlineStore(productGid) {
+  if (!_onlineStorePublicationId) {
+    const pubData = await shopifyAdminGraphQL(`{ publications(first: 20) { nodes { id name } } }`)
+    const pub = pubData?.publications?.nodes?.find(
+      (p) => p.name === 'Online Store' || p.name?.toLowerCase().includes('online store'),
+    )
+    if (!pub) return
+    _onlineStorePublicationId = pub.id
+  }
+  await shopifyAdminGraphQL(`
+    mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+      publishablePublish(id: $id, input: $input) {
+        userErrors { field message }
+      }
+    }
+  `, { id: productGid, input: [{ publicationId: _onlineStorePublicationId }] })
+}
+
+async function toolScanDriveForProduct(query) {
+  const token = await getAccessToken('google')
+  if (!token) return { error: 'Google Drive not connected', files: [] }
+
+  const results = await searchGoogleDrive(query)
+  if (!results.length) return { files: [], message: 'No Drive files found for query: ' + query }
+
+  const deduped = dedupeFiles(results).slice(0, 5)
+  const withText = await Promise.all(
+    deduped.map(async (file) => ({
+      id: file.id,
+      name: file.name,
+      mimeType: file.mimeType,
+      webUrl: file.webUrl,
+      text: await readFileText(file),
+    })),
+  )
+  return { files: withText }
+}
+
+// ─── Tool definitions ─────────────────────────────────────────────────────────
+
+const STOREFRONT_TOOLS = [
+  {
+    name: 'get_storefront_audit',
+    description: 'Fetch a summary of the current storefront: products, pages, and theme settings overview.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'get_theme_settings',
+    description: 'Read the full settings_data.json from the active theme.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'update_theme_settings',
+    description: 'Deep-merge updates into the active theme settings_data.json.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        updates: {
+          type: 'object',
+          description: 'Nested object of settings keys and values to merge into current settings_data.json.',
+        },
+      },
+      required: ['updates'],
+    },
+  },
+  {
+    name: 'get_pages',
+    description: 'List all storefront pages (title, handle, published status, body HTML).',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'create_or_update_page',
+    description: 'Create a new page or update an existing one (pass id to update).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Page ID for updates; omit to create.' },
+        title: { type: 'string' },
+        body_html: { type: 'string' },
+        handle: { type: 'string' },
+        published: { type: 'boolean' },
+      },
+      required: ['title', 'body_html'],
+    },
+  },
+  {
+    name: 'get_menus',
+    description: 'Fetch all navigation menus and their items.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'create_collection',
+    description: 'Create a new product collection.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        descriptionHtml: { type: 'string' },
+        published: { type: 'boolean' },
+      },
+      required: ['title'],
+    },
+  },
+  {
+    name: 'publish_product',
+    description: 'Set a product status to ACTIVE (publish it).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        productId: { type: 'string', description: 'Shopify product GID or numeric ID.' },
+      },
+      required: ['productId'],
+    },
+  },
+  {
+    name: 'scan_drive_for_product',
+    description: 'Search Google Drive for files matching a query and return their text content for product extraction.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search term to find relevant Drive files.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'delete_product',
+    description: 'Permanently delete a product from the Shopify store.',
+    input_schema: {
+      type: 'object',
+      properties: { productId: { type: 'string', description: 'Product GID or numeric ID' } },
+      required: ['productId'],
+    },
+  },
+  {
+    name: 'unpublish_product',
+    description: 'Set a product back to Draft (hide it from the storefront without deleting).',
+    input_schema: {
+      type: 'object',
+      properties: { productId: { type: 'string' } },
+      required: ['productId'],
+    },
+  },
+  {
+    name: 'update_product',
+    description: 'Update an existing product\'s title, description, price, vendor, type, or tags.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        productId: { type: 'string', description: 'Product GID or numeric ID' },
+        fields: {
+          type: 'object',
+          description: 'Fields to update: title, descriptionHtml, price, vendor, productType, tags',
+        },
+      },
+      required: ['productId', 'fields'],
+    },
+  },
+  {
+    name: 'delete_page',
+    description: 'Delete a page from the Shopify store.',
+    input_schema: {
+      type: 'object',
+      properties: { pageId: { type: 'number', description: 'Numeric page ID' } },
+      required: ['pageId'],
+    },
+  },
+  {
+    name: 'delete_collection',
+    description: 'Delete a collection from the Shopify store.',
+    input_schema: {
+      type: 'object',
+      properties: { collectionId: { type: 'string', description: 'Collection GID or numeric ID' } },
+      required: ['collectionId'],
+    },
+  },
+  {
+    name: 'add_product_to_collection',
+    description: 'Add a product to an existing collection.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        productId: { type: 'string' },
+        collectionId: { type: 'string' },
+      },
+      required: ['productId', 'collectionId'],
+    },
+  },
+  {
+    name: 'create_shopify_product',
+    description: 'Create a product in Shopify from a draft object. Sets status to ACTIVE to publish immediately when instructed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        descriptionHtml: { type: 'string' },
+        price: { type: 'string', description: 'Price as a string e.g. "29.99".' },
+        vendor: { type: 'string' },
+        productType: { type: 'string' },
+        status: { type: 'string', enum: ['DRAFT', 'ACTIVE'], description: 'Use ACTIVE to publish immediately.' },
+        tags: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['title', 'descriptionHtml'],
+    },
+  },
+]
+
+async function toolDeleteProduct(productId) {
+  const gid = productId.startsWith('gid://') ? productId : `gid://shopify/Product/${productId}`
+  const data = await shopifyAdminGraphQL(`
+    mutation productDelete($input: ProductDeleteInput!) {
+      productDelete(input: $input) {
+        deletedProductId
+        userErrors { field message }
+      }
+    }
+  `, { input: { id: gid } })
+  if (data?.productDelete?.userErrors?.length) {
+    throw new Error(data.productDelete.userErrors.map((e) => e.message).join('; '))
+  }
+  return { success: true, deletedId: data?.productDelete?.deletedProductId }
+}
+
+async function toolUnpublishProduct(productId) {
+  const gid = productId.startsWith('gid://') ? productId : `gid://shopify/Product/${productId}`
+  const data = await shopifyAdminGraphQL(`
+    mutation productUpdate($input: ProductInput!) {
+      productUpdate(input: $input) {
+        product { id status }
+        userErrors { field message }
+      }
+    }
+  `, { input: { id: gid, status: 'DRAFT' } })
+  if (data?.productUpdate?.userErrors?.length) {
+    throw new Error(data.productUpdate.userErrors.map((e) => e.message).join('; '))
+  }
+  return data?.productUpdate?.product
+}
+
+async function toolUpdateProduct(productId, fields) {
+  const gid = productId.startsWith('gid://') ? productId : `gid://shopify/Product/${productId}`
+  const inputFields = { id: gid }
+  if (fields.title) inputFields.title = fields.title
+  if (fields.descriptionHtml) inputFields.descriptionHtml = fields.descriptionHtml
+  if (fields.vendor) inputFields.vendor = fields.vendor
+  if (fields.productType) inputFields.productType = fields.productType
+  if (fields.tags) inputFields.tags = fields.tags
+
+  const data = await shopifyAdminGraphQL(`
+    mutation productUpdate($input: ProductInput!) {
+      productUpdate(input: $input) {
+        product { id title status handle }
+        userErrors { field message }
+      }
+    }
+  `, { input: inputFields })
+  if (data?.productUpdate?.userErrors?.length) {
+    throw new Error(data.productUpdate.userErrors.map((e) => e.message).join('; '))
+  }
+
+  // Update price if provided
+  if (fields.price) {
+    const product = data?.productUpdate?.product
+    if (product) {
+      const varData = await shopifyAdminGraphQL(`
+        { product(id: "${gid}") { variants(first:1) { nodes { id } } } }
+      `)
+      const variantId = varData?.product?.variants?.nodes?.[0]?.id
+      if (variantId) {
+        const priceStr = parseFloat(String(fields.price).replace(/[^0-9.]/g, '')).toFixed(2)
+        await shopifyAdminGraphQL(`
+          mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+            productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+              userErrors { field message }
+            }
+          }
+        `, { productId: gid, variants: [{ id: variantId, price: priceStr }] })
+      }
+    }
+  }
+
+  return data?.productUpdate?.product
+}
+
+async function toolDeletePage(pageId) {
+  await shopifyRest('DELETE', `/pages/${pageId}.json`)
+  return { success: true, deletedId: pageId }
+}
+
+async function toolDeleteCollection(collectionId) {
+  const gid = collectionId.startsWith('gid://') ? collectionId : `gid://shopify/Collection/${collectionId}`
+  const data = await shopifyAdminGraphQL(`
+    mutation collectionDelete($input: CollectionDeleteInput!) {
+      collectionDelete(input: $input) {
+        deletedCollectionId
+        userErrors { field message }
+      }
+    }
+  `, { input: { id: gid } })
+  if (data?.collectionDelete?.userErrors?.length) {
+    throw new Error(data.collectionDelete.userErrors.map((e) => e.message).join('; '))
+  }
+  return { success: true, deletedId: data?.collectionDelete?.deletedCollectionId }
+}
+
+async function toolAddProductToCollection(productId, collectionId) {
+  const productGid = productId.startsWith('gid://') ? productId : `gid://shopify/Product/${productId}`
+  const collectionGid = collectionId.startsWith('gid://') ? collectionId : `gid://shopify/Collection/${collectionId}`
+  const data = await shopifyAdminGraphQL(`
+    mutation collectionAddProducts($id: ID!, $productIds: [ID!]!) {
+      collectionAddProducts(id: $id, productIds: $productIds) {
+        collection { id title }
+        userErrors { field message }
+      }
+    }
+  `, { id: collectionGid, productIds: [productGid] })
+  if (data?.collectionAddProducts?.userErrors?.length) {
+    throw new Error(data.collectionAddProducts.userErrors.map((e) => e.message).join('; '))
+  }
+  return data?.collectionAddProducts?.collection
+}
+
+async function executeTool(name, input) {
+  switch (name) {
+    case 'get_storefront_audit':
+      return toolGetStorefrontAudit()
+    case 'get_theme_settings':
+      return toolGetThemeSettings()
+    case 'update_theme_settings':
+      return toolUpdateThemeSettings(input.updates)
+    case 'get_pages':
+      return toolGetPages()
+    case 'create_or_update_page':
+      return toolCreateOrUpdatePage(input)
+    case 'delete_page':
+      return toolDeletePage(input.pageId)
+    case 'get_menus':
+      return toolGetMenus()
+    case 'create_collection':
+      return toolCreateCollection(input)
+    case 'delete_collection':
+      return toolDeleteCollection(input.collectionId)
+    case 'add_product_to_collection':
+      return toolAddProductToCollection(input.productId, input.collectionId)
+    case 'publish_product':
+      return toolPublishProduct(input.productId)
+    case 'unpublish_product':
+      return toolUnpublishProduct(input.productId)
+    case 'delete_product':
+      return toolDeleteProduct(input.productId)
+    case 'update_product':
+      return toolUpdateProduct(input.productId, input.fields)
+    case 'scan_drive_for_product':
+      return toolScanDriveForProduct(input.query)
+    case 'create_shopify_product': {
+      const draft = {
+        title: input.title,
+        descriptionHtml: input.descriptionHtml,
+        price: input.price || null,
+        vendor: input.vendor || null,
+        productType: input.productType || null,
+        tags: input.tags || [],
+        status: input.status || 'ACTIVE',
+      }
+      return createShopifyDraftProduct(draft)
+    }
+    default:
+      throw new Error(`Unknown tool: ${name}`)
+  }
+}
+
+async function runStorefrontAgentForChat(emit, message, history) {
+  const chatHistory = history.slice(-6).map((m) => ({
+    role: m.sender === 'assistant' ? 'assistant' : 'user',
+    content: m.text || '',
+  }))
+  const wrapEmit = (event) => {
+    if (event.type === 'final') {
+      emit({ type: 'final', display: { answer: event.answer, files: [] }, raw: {} })
+    } else {
+      emit(event)
+    }
+  }
+  await runStorefrontAgent(wrapEmit, message, chatHistory)
+}
+
+async function runStorefrontAgent(emit, userMessage, history) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    emit({ type: 'final', answer: 'ANTHROPIC_API_KEY is not configured.' })
+    return
+  }
+
+  const systemPrompt = [
+    'You are a Shopify storefront agent for stormlite-jcdk0nv8.myshopify.com.',
+    'You can audit and modify this store: products, pages, menus, collections, and theme settings.',
+    'When asked to scan Drive and upload a product, set status to ACTIVE to publish immediately.',
+    'When the user says "publish it", "upload it", "add it to my store/website" — look at the conversation history for the product name/details they are referring to, then create_shopify_product with that info and status ACTIVE.',
+    'Always call get_storefront_audit first to understand the current state of the store.',
+    'Be decisive — take actions and report what you did in 2-3 sentences max. No bullet lists, no markdown bold (**), no headers.',
+    'When reporting a product URL, always use https://stormlite-jcdk0nv8.myshopify.com/products/{handle} — never the shopifypreview.com URL.',
+    'The store has password protection (password: yauwoh) — products with ACTIVE status ARE live on the real storefront.',
+    'If Shopify is not configured, say so clearly.',
+  ].join('\n')
+
+  const messages = [
+    ...history.map((entry) => ({
+      role: entry.role === 'assistant' ? 'assistant' : 'user',
+      content: entry.content || '',
+    })),
+    { role: 'user', content: userMessage },
+  ]
+
+  let iterations = 0
+  const MAX_ITERATIONS = 10
+
+  while (iterations < MAX_ITERATIONS) {
+    iterations++
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 4096,
+        system: systemPrompt,
+        tools: STOREFRONT_TOOLS,
+        messages,
+      }),
+    })
+
+    if (!response.ok) {
+      const errText = await response.text()
+      throw new Error(`Anthropic API error: ${response.status} ${errText.slice(0, 300)}`)
+    }
+
+    const data = await response.json()
+    const { stop_reason, content } = data
+
+    // Emit any text blocks from this turn as agent_text
+    const textBlocks = content.filter((b) => b.type === 'text')
+    for (const block of textBlocks) {
+      if (block.text?.trim()) {
+        emit({ type: 'agent_text', text: block.text.trim() })
+      }
+    }
+
+    // Add assistant turn to messages
+    messages.push({ role: 'assistant', content })
+
+    if (stop_reason === 'end_turn' || stop_reason === 'stop_sequence') {
+      const finalText = textBlocks.map((b) => b.text).join('\n').trim()
+      emit({ type: 'final', answer: finalText || 'Done.' })
+      return
+    }
+
+    // Process tool uses
+    const toolUseBlocks = content.filter((b) => b.type === 'tool_use')
+    if (!toolUseBlocks.length) {
+      const finalText = textBlocks.map((b) => b.text).join('\n').trim()
+      emit({ type: 'final', answer: finalText || 'Done.' })
+      return
+    }
+
+    const toolResultContents = []
+    for (const toolUse of toolUseBlocks) {
+      emit({ type: 'tool_call', name: toolUse.name, input: toolUse.input })
+
+      let toolResult
+      let isError = false
+      try {
+        toolResult = await executeTool(toolUse.name, toolUse.input)
+      } catch (err) {
+        toolResult = { error: err.message }
+        isError = true
+      }
+
+      emit({ type: 'tool_result', name: toolUse.name, result: toolResult, error: isError })
+
+      toolResultContents.push({
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: JSON.stringify(toolResult),
+      })
+    }
+
+    // Add tool results as user turn
+    messages.push({ role: 'user', content: toolResultContents })
+  }
+
+  emit({ type: 'final', answer: 'Max iterations reached. The agent stopped after 10 rounds.' })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

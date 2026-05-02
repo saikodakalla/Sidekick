@@ -40,5 +40,20 @@
       "urban"
     ],
     "createdAt": "2026-05-01T18:16:18.382Z"
+  },
+  {
+    "id": "mock-1777719255938",
+    "title": "Water Bottle",
+    "status": "Draft",
+    "inventory": "1 variant",
+    "type": "Drinkware",
+    "vendor": "Example",
+    "price": "20.00",
+    "tags": [
+      "water bottle",
+      "hydration",
+      "reusable"
+    ],
+    "createdAt": "2026-05-02T10:54:15.938Z"
   }
 ]
